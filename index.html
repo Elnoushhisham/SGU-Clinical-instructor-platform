@@ -317,7 +317,6 @@ const State = {
     lastSyncedAt: null,
     lastSyncError: '',
     coordinatorEmail: 'clinicaltutorsyear2@sgu.edu',
-    leaveAccessCode: 'SGU2026',
   },
   overrides: {},     // { issue_key: {resolved:true, note:""} }
 };
@@ -433,7 +432,8 @@ function leaveAccessKey(){
   return 'leave_access_ok_' + id;
 }
 function hasLeaveAccess(){
-  return sessionStorage.getItem(leaveAccessKey()) === '1';
+  // Leave request security gate removed by request.
+  return true;
 }
 function hasOverlappingLeave(instructorId, startISO, endISO, excludeRequestId){
   const wanted = new Set(dateRange(startISO, endISO));
@@ -1158,30 +1158,7 @@ function buildMonthCalendar(month, opts){
 
 /* -------- 7b. INSTRUCTOR LEAVE TAB --------------------- */
 function instructorLeave(main){
-  if(!hasLeaveAccess()){
-    const gate = el('div',{class:'card'});
-    gate.appendChild(el('h2',null,'Leave request security'));
-    gate.appendChild(el('div',{class:'note warn'},
-      'For privacy, the Leave tab is protected. Enter the leave access code from the coordinator before viewing or submitting leave requests for this selected instructor.'));
-    const code = el('input',{type:'password',placeholder:'Leave access code'});
-    gate.appendChild(code);
-    gate.appendChild(el('div',{class:'cluster',style:{marginTop:'.6rem'}},
-      el('button',{class:'btn',onclick:()=>{
-        if(code.value.trim() === (State.settings.leaveAccessCode || 'SGU2026')){
-          sessionStorage.setItem(leaveAccessKey(),'1');
-          renderInstructorView('leave');
-        } else {
-          toast('Incorrect leave access code','err');
-        }
-      }},'Unlock Leave tab'),
-      el('button',{class:'btn secondary',onclick:()=>go('#instructor/profile')},'Back to profile')
-    ));
-    const msg = el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.6rem'}},
-      'The coordinator can change this code under Coordinator → Settings. This is privacy gating for the client-side app; stronger identity-based security requires SGU Microsoft login / a backend.');
-    gate.appendChild(msg);
-    main.appendChild(gate);
-    return;
-  }
+  // Leave access-code gate removed. Instructors can open the leave request page directly.
   // Top: New request form
   const formCard = el('div',{class:'card'});
   formCard.appendChild(el('h2',null,'Request leave of absence'));
@@ -1509,7 +1486,7 @@ function adminLeave(main){
 
   // ===== Import historical leave Excel =====
   const impCard = el('div',{class:'card'});
-  impCard.appendChild(el('h2',null,'Import historical leave records'));
+  impCard.appendChild(el('h2',null,'Upload already-approved leave data'));
   impCard.appendChild(el('div',{class:'note'},
     'Upload one or more Excel files containing already-approved leave (you can upload several in a row). The importer auto-detects two shapes: '+
     '"long" (one row per leave: Name, Start Date, End Date, Type) or "daily" (one row per day: Name, Date, Type). '+
@@ -2256,7 +2233,7 @@ function adminImport(main){
   const sync = el('div',{class:'card'});
   sync.appendChild(el('h2',null,'Upload master Excel workbook'));
   sync.appendChild(el('div',{class:'note'},
-    'This version uses manual Excel upload only. Upload the updated master .xlsx file whenever you want to refresh the app. The importer will rebuild instructors, schedule, assignments, attendance, and review sessions from the workbook.'));
+    'This version uses manual Excel upload only. Upload the updated master .xlsx file whenever you want to refresh the app. After import, the app saves the new data and reloads automatically so all pages use the updated workbook. Existing leave records entered/imported in the app are preserved.'));
   const fileInput = el('input',{type:'file',accept:'.xlsx,.xls'});
   const uploadStatus = el('div',{class:'muted',style:{marginTop:'.5rem',fontSize:'.88rem'}});
   sync.appendChild(fileInput);
@@ -2274,15 +2251,21 @@ function adminImport(main){
       const buf = await file.arrayBuffer();
       const wb = XLSX.read(buf, {cellDates:true});
       const parsed = parseWorkbook(wb);
+      // Keep leave records that were added/imported in the app, while replacing
+      // the master roster/schedule data with the newly uploaded workbook.
+      const existingLeave = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
+      parsed.leave_requests = existingLeave;
+      parsed.meta = Object.assign({}, parsed.meta || {}, { source_file: file.name, parsed_at: new Date().toISOString() });
       State.data = parsed;
       sanitizeDataset();
       ensureLeaveTable();
+      State.overrides = {}; // old issue resolutions may refer to old activity IDs
       State.settings.syncUrl = '';
       State.settings.lastSyncedAt = new Date().toISOString();
       State.settings.lastSyncError = '';
       await persist();
-      uploadStatus.textContent = `Imported ${State.data.instructors.length} instructors, ${State.data.master_schedule.length} activities, and ${State.data.assignments.length} assignments from ${file.name}.`;
-      toast('Workbook imported','ok');
+      uploadStatus.textContent = `Imported ${State.data.instructors.length} instructors, ${State.data.master_schedule.length} activities, and ${State.data.assignments.length} assignments from ${file.name}. Refreshing app…`;
+      toast('Workbook imported — refreshing','ok');
       clear(preview);
       preview.appendChild(el('h3',null,'Imported data'));
       preview.appendChild(el('div',{class:'kpi-grid'},
@@ -2291,7 +2274,10 @@ function adminImport(main){
         kpi(State.data.assignments.length,'Assignments'),
         kpi(State.data.review_sessions.length,'Reviews')
       ));
-      renderAdminView('import');
+      // Allow selecting the same filename again after editing it locally.
+      fileInput.value = '';
+      // Force a full reload so every dashboard/table/calendar reads the new workbook from storage.
+      setTimeout(()=>location.reload(), 700);
     }catch(err){
       uploadStatus.textContent = 'Import failed: '+(err.message||err);
       toast('Import failed','err');
@@ -2409,21 +2395,16 @@ function adminSettings(main){
   const card = el('div',{class:'card'});
   card.appendChild(el('h2',null,'Settings'));
   const pw = el('input',{type:'text', value: State.settings.passcode});
-  const leaveCode = el('input',{type:'text', value: State.settings.leaveAccessCode || 'SGU2026'});
   const coordEmail = el('input',{type:'email', value: State.settings.coordinatorEmail || 'clinicaltutorsyear2@sgu.edu'});
   card.appendChild(el('label',null,
     el('div',{class:'muted',style:{fontSize:'.85rem',marginBottom:'.2rem'}},'Coordinator passcode'),
     pw));
-  card.appendChild(el('label',null,
-    el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.6rem',marginBottom:'.2rem'}},'Leave tab access code'),
-    leaveCode));
   card.appendChild(el('label',null,
     el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.6rem',marginBottom:'.2rem'}},'Leave request email address'),
     coordEmail));
   card.appendChild(' ');
   card.appendChild(el('button',{class:'btn',onclick:async()=>{
     State.settings.passcode = pw.value || DEFAULT_PASSCODE;
-    State.settings.leaveAccessCode = leaveCode.value || 'SGU2026';
     State.settings.coordinatorEmail = coordEmail.value || 'clinicaltutorsyear2@sgu.edu';
     await persist(); toast('Settings updated','ok');
   }},'Save settings'));
