@@ -405,10 +405,14 @@ function pendingLeaveCount(){
 }
 
 function getAppScheduleMonths(){
-  // Use assignment months as the source of truth. This prevents older timetable
-  // sheets from leaking older dates into the app when the workbook only
-  // has April and May roster tabs.
-  const months = [...new Set((State.data.assignments||[]).map(a => monthOf(a.date)).filter(Boolean))].sort();
+  // Use the months stored in meta.schedule_months, which parseWorkbook computes
+  // BEFORE sanitizeDataset runs — so there is no circular dependency and no
+  // template-leftover dates can sneak in.  Falls back gracefully for older
+  // persisted data that pre-dates this field.
+  const stored = State.data && State.data.meta && State.data.meta.schedule_months;
+  if(stored && stored.length) return stored;
+  // Legacy fallback: derive from assignments but snapshot before any filter.
+  const months = [...new Set((State.data.assignments||[]).map(a=>monthOf(a.date)).filter(Boolean))].sort();
   return months.length ? months : ['2026-04','2026-05'];
 }
 function inAllowedScheduleMonths(date){
@@ -418,7 +422,12 @@ function inAllowedScheduleMonths(date){
 function sanitizeDataset(){
   if(!State.data) return;
   ensureLeaveTable();
-  const keepDate = (r, field) => !r[field] || inAllowedScheduleMonths(r[field]);
+  // Snapshot allowed months ONCE before any filtering begins.
+  // This prevents the circular-dependency bug where March template-leftover
+  // assignments (present before the filter runs) would add March to the
+  // allowed list and then survive the filter.
+  const allowed = new Set(getAppScheduleMonths());
+  const keepDate = (r, field) => !r[field] || allowed.has(String(r[field]).slice(0,7));
   State.data.master_schedule = (State.data.master_schedule||[]).filter(r => keepDate(r,'date'));
   State.data.review_sessions = (State.data.review_sessions||[]).filter(r => keepDate(r,'review_date'));
   State.data.assignments = (State.data.assignments||[]).filter(r => keepDate(r,'date'));
@@ -2358,7 +2367,7 @@ function adminImport(main){
   ));
   const months = getAppScheduleMonths();
   current.appendChild(el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.6rem'}},
-    'Active months: '+months.map(monthLabel).join(', ')+'. Only April and May 2026 data is shown.'));
+    'Active months: '+months.map(monthLabel).join(', ')+'.'));
   // Show first few instructors as a quick sanity check
   if(State.data.instructors && State.data.instructors.length){
     const sample = State.data.instructors.slice(0,3).map(i=>i.full_name).join(', ');
@@ -2970,8 +2979,8 @@ function parseWorkbook(wb){
   }
 
   // 6b. Month grids (April / May / June / etc.) — wide instructor×session matrix
-  // Recognised month-grid sheets. Add new month names here as new tabs are added to the workbook.
-  const MONTH_NAMES = new Set(['april','may','june','july']);
+  // Recognised month-grid sheets — any tab whose name is a month name is parsed automatically.
+  const MONTH_NAMES = new Set(['january','february','march','april','may','june','july','august','september','october','november','december']);
   function deriveActivityType(sessionName){
     const s = (sessionName||'').toLowerCase();
     if(s.includes('iti')) return 'ITI';
@@ -3130,7 +3139,15 @@ function parseWorkbook(wb){
   data.instructors = Object.values(instById);
   data.locations = [...new Set(data.master_schedule.map(a=>a.location).filter(Boolean))].sort();
   data.courses = [...new Set(data.master_schedule.map(a=>a.course).filter(Boolean))].sort();
-  data.meta = { source_file: 'imported.xlsx', parsed_at: new Date().toISOString(), sheets_seen: sheets };
+  // Compute schedule months HERE — after all assignments are built but before
+  // sanitizeDataset runs — so the list is clean (no template-leftover dates)
+  // and can be used by getAppScheduleMonths without a circular dependency.
+  const scheduleMons = [...new Set(data.assignments.map(a=>monthOf(a.date)).filter(Boolean))].sort();
+  data.meta = {
+    source_file: 'imported.xlsx', parsed_at: new Date().toISOString(),
+    sheets_seen: sheets,
+    schedule_months: scheduleMons,
+  };
   return data;
 }
 function mergeDatasets(a, b){
