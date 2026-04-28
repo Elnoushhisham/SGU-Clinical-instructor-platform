@@ -518,17 +518,19 @@ async function bootstrap(){
   const persisted = await Storage.load();
   if(persisted && persisted.data){
     const d = persisted.data;
-    // Auto-migrate: if old cached data is missing BOTH schedule_months AND sheets_seen
-    // it predates all our parser fixes and may contain template-leftover March data.
-    // Replace transparently with the embedded seed (which is clean).
-    const hasMeta = d.meta && (d.meta.schedule_months || (d.meta.sheets_seen && d.meta.sheets_seen.length));
-    if(!hasMeta){
+    // Auto-migrate: cached data with parser_version < 3 (or no version) was produced
+    // by an older parser that could include template-leftover March dates in assignments
+    // and/or a contaminated schedule_months list.  Silently replace with the embedded
+    // seed data so the March ghost is gone without requiring any manual action.
+    // Leave requests are always preserved across the migration.
+    const pv = d.meta && d.meta.parser_version;
+    const needsMigration = !pv || pv < 3;
+    if(needsMigration){
       const seed = getSeed();
       if(seed){
-        // Preserve leave_requests so users don't lose any submitted requests.
-        seed.leave_requests = (d.leave_requests||[]);
+        seed.leave_requests = (d.leave_requests || []);
         State.data = seed;
-        console.info('bootstrap: auto-migrated stale pre-v2 cache to embedded seed');
+        console.info('bootstrap: migrated parser_version', pv||'(none)', '→ 3 (using embedded seed)');
         await persist();
       } else {
         State.data = d;
