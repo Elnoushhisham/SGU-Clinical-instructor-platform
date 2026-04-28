@@ -426,7 +426,8 @@ function _sheetMonthsFromMeta(meta, assignments){
 }
 function getAppScheduleMonths(){
   const meta = State.data && State.data.meta;
-  const stored = meta && meta.schedule_months;
+  // Accept both schedule_months (Excel import / v3) and keep_months (publish-script JSON).
+  const stored = meta && (meta.schedule_months || meta.keep_months);
   const sheets = (meta && meta.sheets_seen) || [];
 
   // Build month-names-of-sheets set so we can validate any stored list.
@@ -504,6 +505,7 @@ async function fetchFromDataUrl(url){
     throw new Error('JSON does not contain an instructors array — check the URL.');
   const existingLeave = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
   newData.leave_requests = existingLeave;
+  normalizeImportedJson(newData);
   State.data = newData;
   sanitizeDataset();
   ensureLeaveTable();
@@ -511,6 +513,22 @@ async function fetchFromDataUrl(url){
   State.settings.lastSyncError = '';
   await persist();
   return newData;
+}
+// Normalise externally-produced JSON (e.g. roster-data.json from the publish script)
+// so it is treated as a first-class v3 dataset and survives bootstrap without being
+// wiped by the parser_version migration.
+function normalizeImportedJson(d){
+  if(!d.meta) d.meta = {};
+  // Copy keep_months → schedule_months so getAppScheduleMonths finds it.
+  if(!d.meta.schedule_months && d.meta.keep_months && d.meta.keep_months.length)
+    d.meta.schedule_months = d.meta.keep_months.slice();
+  // Derive schedule_months from sheets_seen if still absent.
+  if(!d.meta.schedule_months || !d.meta.schedule_months.length){
+    const derived = _sheetMonthsFromMeta(d.meta, d.assignments);
+    if(derived.length) d.meta.schedule_months = derived;
+  }
+  // Stamp parser_version so bootstrap won't auto-migrate this data away.
+  d.meta.parser_version = 3;
 }
 
 
@@ -2395,6 +2413,7 @@ function adminImport(main){
         throw new Error('Not a valid roster JSON (no instructors array).');
       const existingLeave = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
       newData.leave_requests = existingLeave;
+      normalizeImportedJson(newData);
       State.data = newData;
       if(parsed.settings) Object.assign(State.settings, parsed.settings, {passcode:State.settings.passcode});
       if(parsed.overrides) State.overrides = parsed.overrides;
