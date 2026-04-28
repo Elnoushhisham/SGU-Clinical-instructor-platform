@@ -2,7 +2,7 @@
  "data": {
   "meta": {
    "source_file": "Year2 Master sheet Spring 2026 app.xlsx",
-   "parsed_at": "2026-04-28T04:20:48.222Z",
+   "parsed_at": "2026-04-28T04:43:13.303Z",
    "sheets_seen": [
     "Review sessions Timetable",
     "Review session attendance",
@@ -2796,7 +2796,7 @@
   "theme": "auto",
   "dataUrl": "http://localhost:8888/notebooks/Downloads/Untitled1.ipynb",
   "dataUrlAutoFetch": true,
-  "lastSyncedAt": "2026-04-28T04:20:48.222Z",
+  "lastSyncedAt": "2026-04-28T04:43:13.303Z",
   "lastSyncError": "",
   "coordinatorEmail": "clinicaltutorsyear2@sgu.edu",
   "syncUrl": "",
