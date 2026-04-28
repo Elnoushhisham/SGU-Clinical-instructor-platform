@@ -2359,16 +2359,25 @@ function adminImport(main){
   const months = getAppScheduleMonths();
   current.appendChild(el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.6rem'}},
     'Active months: '+months.map(monthLabel).join(', ')+'. Only April and May 2026 data is shown.'));
+  // Show first few instructors as a quick sanity check
+  if(State.data.instructors && State.data.instructors.length){
+    const sample = State.data.instructors.slice(0,3).map(i=>i.full_name).join(', ');
+    current.appendChild(el('div',{class:'muted',style:{fontSize:'.82rem',marginTop:'.3rem'}},
+      'Sample names: '+sample));
+  }
   main.appendChild(current);
 
   /* ─── 5. Reset ───────────────────────────────────────────────── */
   const reset = el('div',{class:'card'});
-  reset.appendChild(el('h2',null,'Reset'));
-  reset.appendChild(el('div',{class:'note warn'},'Clears locally stored data and reloads the data embedded in this HTML file.'));
+  reset.appendChild(el('h2',null,'Seeing emails instead of names, or missing reviews?'));
+  reset.appendChild(el('div',{class:'note warn',style:{marginBottom:'.7rem'}},
+    'This is almost always caused by old data cached in this browser. ' +
+    'Tap "Clear & reload" below — it wipes the local cache — then re-upload the Excel file. ' +
+    'After the upload you should see names, assignments, and review sessions all correct.'));
   reset.appendChild(el('button',{class:'btn danger',onclick:async()=>{
     if(!confirm('Clear local data and reset to embedded seed?')) return;
     await Storage.clear(); location.reload();
-  }},'Reset this device'));
+  }},'Clear cache & reload'));
   main.appendChild(reset);
 }
 
@@ -2814,9 +2823,15 @@ function parseWorkbook(wb){
   const instById = {};
 
   function addInstructor(name, email, dept, slot, source){
-    name = vstr(name).replace(/\s+/g,' ');
-    if(!name || name === 'Not Yet added/Resigned' || name === '#REF!') return null;
-    email = vstr(email).toLowerCase();
+    name  = vstr(name).replace(/\s+/g,' ');
+    email = vstr(email);
+    // Column-swap guard: if 'name' looks like an email address, the sheet probably
+    // has email in an unexpected column — swap them and recover gracefully.
+    if(name.includes('@') && !email.includes('@') && email.length > 1){
+      const tmp = name; name = email.replace(/\s+/g,' '); email = tmp;
+    }
+    if(!name || name === 'Not Yet added/Resigned' || name === '#REF!' || name.includes('@')) return null;
+    email = email.toLowerCase();
     const bare = name.replace(/^(Dr\.?|Mr\.?|Mrs\.?|Ms\.?|Prof(?:essor)?\.?)\s+/i,'').toLowerCase();
     const key = (email || bare).replace(/\s+/g,'');
     if(!key) return null;
@@ -2858,6 +2873,8 @@ function parseWorkbook(wb){
       const colFull = 0, colEmail = 6, colSlot = 4, colDept = 5;
       for(let i=h.idx+1;i<rows.length;i++){
         const r = rows[i] || []; const full = vstr(r[colFull]); if(!full) continue;
+        // Skip rows where the "name" column holds a pure number (e.g. count totals in row above header)
+        if(/^\d+$/.test(full)) continue;
         addInstructor(full, r[colEmail], (r[colDept]||'').toString().includes('REF')?'':vstr(r[colDept]), vstr(r[colSlot]), sn);
       }
     }
