@@ -2297,7 +2297,7 @@ function adminImport(main){
       State.settings.lastSyncedAt = new Date().toISOString();
       State.settings.lastSyncError = '';
       await persist();
-      uploadStatus.textContent = 'Imported '+State.data.instructors.length+' instructors, '+State.data.master_schedule.length+' activities from '+file.name+'.';
+      uploadStatus.textContent = 'Imported '+State.data.instructors.length+' instructors, '+State.data.master_schedule.length+' activities, '+State.data.assignments.length+' assignments, '+State.data.review_sessions.length+' review sessions from '+file.name+'.';
       toast('Workbook imported — refreshing','ok');
       clear(xlsPreview);
       xlsPreview.appendChild(el('div',{class:'kpi-grid'},
@@ -2771,6 +2771,43 @@ function vtime(v){
   if(ap === 'pm' && h < 12) h += 12; if(ap === 'am' && h === 12) h = 0;
   return `${pad(h)}:${mn}`;
 }
+// Robustly read a date from a worksheet cell, bypassing formatted strings.
+// sheet_to_json(raw:false) returns formatted text like "7-Apr" (no year), which vdate cannot
+// reconstruct. This helper falls back to the raw cell value when needed.
+function cellToISO(ws, r, c, formattedStr){
+  const d = vdate(formattedStr);
+  if(d && /^\d{4}-\d{2}-\d{2}/.test(d)) return d;
+  const raw = ws[XLSX.utils.encode_cell({r, c})];
+  if(!raw || raw.v == null) return '';
+  if(raw.v instanceof Date){
+    // cellDates:true already converted the serial — use UTC components to avoid timezone shift
+    return `${raw.v.getUTCFullYear()}-${pad(raw.v.getUTCMonth()+1)}-${pad(raw.v.getUTCDate())}`;
+  }
+  if(typeof raw.v === 'number' && raw.v > 30000 && raw.v < 80000){
+    // Excel date serial → ISO; correct for Excel's phantom Feb-29-1900 (serial 60)
+    const adj = raw.v > 59 ? raw.v - 1 : raw.v;
+    const dt = new Date((adj - 25568) * 86400 * 1000);
+    return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth()+1)}-${pad(dt.getUTCDate())}`;
+  }
+  return '';
+}
+// Robustly read a time from a worksheet cell.
+// With cellDates:true + raw:false, times may come out as "8:00 AM" (vtime handles that) but
+// if the formatted string is absent we fall back to the raw fractional-day number.
+function cellToTime(ws, r, c, formattedStr){
+  const t = vtime(formattedStr);
+  if(t && /^\d{1,2}:\d{2}/.test(t)) return t;
+  const raw = ws[XLSX.utils.encode_cell({r, c})];
+  if(!raw || raw.v == null) return '';
+  if(raw.v instanceof Date){
+    return `${pad(raw.v.getUTCHours())}:${pad(raw.v.getUTCMinutes())}`;
+  }
+  if(typeof raw.v === 'number' && raw.v >= 0 && raw.v < 1){
+    const mins = Math.round(raw.v * 24 * 60);
+    return `${pad(Math.floor(mins/60))}:${pad(mins%60)}`;
+  }
+  return '';
+}
 function parseWorkbook(wb){
   const sheets = wb.SheetNames;
   const data = emptyDataset();
@@ -2895,11 +2932,12 @@ function parseWorkbook(wb){
         if(lower.includes('course') && lower.some(x=>x.includes('discipline'))){ header = lower; break; }
       }
       if(!header) continue;
+      const revWs = wb.Sheets[sn];
       let lastDate = '';
       for(let i=2;i<rows.length;i++){
         const r = rows[i]||[];
-        const d = vdate(r[2]); if(d) lastDate = d;
-        const time = vtime(r[3]); const sg = vstr(r[5]); const disc = vstr(r[6]);
+        const d = cellToISO(revWs, i, 2, r[2]); if(d) lastDate = d;
+        const time = cellToTime(revWs, i, 3, r[3]); const sg = vstr(r[5]); const disc = vstr(r[6]);
         if(!lastDate || (!sg && !disc && !time)) continue;
         data.review_sessions.push({
           review_id: newId('rev', lastDate, time, sg, disc),
@@ -2987,8 +3025,9 @@ function parseWorkbook(wb){
     const ncols = Math.max(rows[DATE_ROW]?.length||0, rows[SESSION_ROW]?.length||0, rows[COURSE_ROW]?.length||0);
     let lastValidCol = ncols - 1;
     for(let c=dateStartCol;c<ncols;c++){
-      const dRaw = (rows[DATE_ROW]||[])[c];
-      const dParsed = vdate(dRaw);
+      // Use cellToISO — this correctly handles cells formatted as "7-Apr" (no year) by reading
+      // the raw serial number from the worksheet instead of the formatted display string.
+      const dParsed = cellToISO(ws, DATE_ROW, c, (rows[DATE_ROW]||[])[c]);
       if(dParsed && /^\d{4}-\d{2}-\d{2}/.test(dParsed)){
         const ds = dParsed.slice(0,10);
         if(firstDate === null) firstDate = ds;
@@ -2999,16 +3038,27 @@ function parseWorkbook(wb){
       const se = vstr((rows[SESSION_ROW]||[])[c]); if(se) lastSession = se;
       const v  = vstr((rows[VENUE_ROW]||[])[c]); if(v) lastVenue = v;
       const coh = vstr((rows[COHORT_ROW]||[])[c]);
-      const t = (rows[TIME_ROW]||[])[c];
+      // Use cellToTime — handles "8:00 AM" strings and raw fractional-day numbers.
+      const timeParsed = cellToTime(ws, TIME_ROW, c, (rows[TIME_ROW]||[])[c]);
       colsMeta[c] = { date: lastDate, course: lastCourse, session: lastSession,
-                      cohort: coh, venue: lastVenue, time: vtime(t) };
+                      cohort: coh, venue: lastVenue, time: timeParsed };
     }
-    // Find first instructor row
+    // Find first instructor row — prefer a row with both name AND email, but fall back to
+    // name-only so a missing email doesn't silently skip the entire sheet.
     let firstRow = -1;
     for(let r=10;r<rows.length;r++){
       const name = vstr((rows[r]||[])[NAME_COL]);
       const em = vstr((rows[r]||[])[EMAIL_COL]);
       if(name && em && em.includes('@')){ firstRow = r; break; }
+    }
+    if(firstRow < 0){
+      // Fallback: accept any row that has a non-trivial name value
+      for(let r=10;r<rows.length;r++){
+        const name = vstr((rows[r]||[])[NAME_COL]);
+        if(name && name.length > 2 && !['name','instructor','full name'].includes(name.toLowerCase())){
+          firstRow = r; break;
+        }
+      }
     }
     if(firstRow < 0) continue;
     for(let r=firstRow;r<rows.length;r++){
