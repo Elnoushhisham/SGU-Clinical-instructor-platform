@@ -301,6 +301,14 @@ small.muted{font-size:.78rem}
 
 /* -------- 1. STATE & STORAGE --------------------------- */
 const DEFAULT_PASSCODE = "1234"; // coordinator passcode (override in Settings)
+// Department chair passwords (change these as needed)
+const DEPT_PASSCODES = {
+  "Microbiology-Pharmacology": "micro123",
+  "Clinical Skills": "skills123",
+  "Pathology": "path123",
+  "Pathophysiology": "physio123",
+};
+const SUPERVISING_PASSCODE = "super123"; // Supervising Faculty passcode
 const STORE_KEY = "clinical_roster_v1";
 
 const State = {
@@ -319,6 +327,8 @@ const State = {
     coordinatorEmail: 'clinicaltutorsyear2@sgu.edu',
   },
   overrides: {},     // { issue_key: {resolved:true, note:""} }
+  approvedLeaveImported: [],  // approved leave from "Approved Leave" sheet upload
+  prevMonthsData: null,       // data from "Previous Months" sheet upload
 };
 
 const Storage = {
@@ -559,6 +569,8 @@ async function bootstrap(){
     State.settings = Object.assign(State.settings, persisted.settings || {});
     State.me = persisted.me || null;
     State.overrides = persisted.overrides || {};
+    State.approvedLeaveImported = persisted.approvedLeaveImported || [];
+    State.prevMonthsData = persisted.prevMonthsData || null;
   } else {
     const seed = getSeed();
     if(seed){
@@ -598,7 +610,9 @@ function ensureLeaveTable(){
 }
 async function persist(){
   await Storage.save({
-    data: State.data, settings: State.settings, me: State.me, overrides: State.overrides
+    data: State.data, settings: State.settings, me: State.me, overrides: State.overrides,
+    approvedLeaveImported: State.approvedLeaveImported,
+    prevMonthsData: State.prevMonthsData,
   });
 }
 
@@ -626,6 +640,8 @@ function setSubtitle(){
   const sub = document.getElementById('title-sub');
   if(State.view === 'instructor' && State.me) sub.textContent = State.me.full_name;
   else if(State.view === 'admin') sub.textContent = 'Coordinator';
+  else if(State.view === 'deptchair') sub.textContent = 'Department Chair';
+  else if(State.view === 'supervising') sub.textContent = 'Supervising Faculty';
   else sub.textContent = 'Year 2 · Spring 2026';
   const syncBtn = document.getElementById('btn-sync');
   if(syncBtn) syncBtn.style.display = 'none';
@@ -764,6 +780,11 @@ const ROUTES = {
   '#admin/cleaning': () => renderAdminView('cleaning'),
   '#admin/export': () => renderAdminView('export'),
   '#admin/settings': () => renderAdminView('settings'),
+  '#deptchair/micro': () => renderDeptChairView('Microbiology-Pharmacology'),
+  '#deptchair/skills': () => renderDeptChairView('Clinical Skills'),
+  '#deptchair/path': () => renderDeptChairView('Pathology'),
+  '#deptchair/physio': () => renderDeptChairView('Pathophysiology'),
+  '#supervising': renderSupervisingFacultyView,
 };
 function routeFromHash(){
   const h = location.hash || '';
@@ -801,6 +822,11 @@ function renderWelcome(){
   const roles = el('div', {class:'role-cards'});
   roles.appendChild(roleCard('🩺','I am a Clinical Instructor','See your assignments, review sessions, and request leave', ()=>go('#instructor')));
   roles.appendChild(roleCard('🎓','I am the Coordinator','Full schedule, conflicts, attendance, leave approvals', ()=>requireCoordinator(()=>go('#admin'))));
+  roles.appendChild(roleCard('🔬','Microbiology-Pharmacology Chair','Department attendance, leave, and instructor calendars', ()=>requireDeptChair('Microbiology-Pharmacology', ()=>go('#deptchair/micro'))));
+  roles.appendChild(roleCard('🩻','Clinical Skills Chair','Department attendance, leave, and instructor calendars', ()=>requireDeptChair('Clinical Skills', ()=>go('#deptchair/skills'))));
+  roles.appendChild(roleCard('🧬','Pathology Chair','Department attendance, leave, and instructor calendars', ()=>requireDeptChair('Pathology', ()=>go('#deptchair/path'))));
+  roles.appendChild(roleCard('🫀','Pathophysiology Chair','Department attendance, leave, and instructor calendars', ()=>requireDeptChair('Pathophysiology', ()=>go('#deptchair/physio'))));
+  roles.appendChild(roleCard('👁️','Supervising Faculty','Find common free times for small group instructors', ()=>requireSupervisingFaculty(()=>go('#supervising'))));
   wrap.appendChild(roles);
 
   const stats = el('div',{class:'kpi-grid',style:{marginTop:'1.5rem',maxWidth:'420px',marginLeft:'auto',marginRight:'auto',padding:'0 1rem'}});
@@ -860,6 +886,28 @@ function requireCoordinator(then){
 }
 
 /* -------- 6. TABS -------------------------------------- */
+function requireDeptChair(dept, then){
+  const input = el('input',{type:'password',placeholder:'Department chair passcode',autofocus:true});
+  modal(dept+' — Chair Sign-in', [input], [
+    el('button',{class:'btn secondary',onclick:closeModal}, 'Cancel'),
+    el('button',{class:'btn',onclick:()=>{
+      if(input.value === DEPT_PASSCODES[dept]){ closeModal(); then(); }
+      else toast('Incorrect passcode','err');
+    }}, 'Continue')
+  ]);
+  setTimeout(()=>input.focus(), 150);
+}
+function requireSupervisingFaculty(then){
+  const input = el('input',{type:'password',placeholder:'Supervising faculty passcode',autofocus:true});
+  modal('Supervising Faculty Sign-in', [input], [
+    el('button',{class:'btn secondary',onclick:closeModal}, 'Cancel'),
+    el('button',{class:'btn',onclick:()=>{
+      if(input.value === SUPERVISING_PASSCODE){ closeModal(); then(); }
+      else toast('Incorrect passcode','err');
+    }}, 'Continue')
+  ]);
+  setTimeout(()=>input.focus(), 150);
+}
 function renderTabs(tabs){
   const nav = document.getElementById('tabs');
   clear(nav);
@@ -932,32 +980,57 @@ function renderInstructorPicker(){
   main.appendChild(card);
 
   // Recently used
-  const last = localStorage.getItem(STORE_KEY+'_recent');
-  if(last){
-    try{
-      const recent = JSON.parse(last);
-      if(recent.length){
-        const recentCard = el('div',{class:'card'});
-        recentCard.appendChild(el('h3',null,'Recent'));
-        const list = el('div',{class:'list'});
-        recent.slice(0,5).forEach(id => {
-          const inst = instructorById(id);
-          if(!inst) return;
-          list.appendChild(el('button',{class:'item',onclick:()=>{
-            State.me = inst; persist(); go('#instructor/dashboard');
-          }},
-            el('div',{class:'item-title'}, inst.full_name),
-            el('div',{class:'meta'},
-              el('span',null,inst.department||''),
-              el('span',null,inst.email||'')
-            )
-          ));
-        });
-        recentCard.appendChild(list);
-        main.appendChild(recentCard);
-      }
-    }catch(e){}
+  function renderRecentCard(){
+    const last = localStorage.getItem(STORE_KEY+'_recent');
+    if(!last) return;
+    let recent;
+    try{ recent = JSON.parse(last); } catch(e){ return; }
+    if(!recent || !recent.length) return;
+    const recentCard = el('div',{class:'card', id:'recent-card'});
+    const headRow = el('div',{class:'row',style:{justifyContent:'space-between',alignItems:'center',marginBottom:'.4rem'}},
+      el('h3',{style:{margin:0}}, 'Recent'),
+      el('button',{class:'btn secondary small',onclick:()=>{
+        localStorage.setItem(STORE_KEY+'_recent', '[]');
+        const card = document.getElementById('recent-card');
+        if(card) card.remove();
+      }}, 'Clear All')
+    );
+    recentCard.appendChild(headRow);
+    const list = el('div',{class:'list'});
+    recent.slice(0,5).forEach(id => {
+      const inst = instructorById(id);
+      if(!inst) return;
+      const row = el('div',{class:'item',style:{flexDirection:'row',alignItems:'center',gap:'.5rem'}});
+      const info = el('button',{style:{flex:'1',background:'none',border:'none',padding:0,textAlign:'left',cursor:'pointer'},onclick:()=>{
+        State.me = inst; persist(); go('#instructor/dashboard');
+      }},
+        el('div',{class:'item-title'}, inst.full_name),
+        el('div',{class:'meta'},
+          el('span',null,inst.department||''),
+          el('span',null,inst.email||'')
+        )
+      );
+      const del = el('button',{class:'btn secondary small',style:{flexShrink:0,padding:'.3rem .5rem',fontSize:'1rem'},
+        title:'Remove from recent',
+        onclick:(e)=>{
+          e.stopPropagation();
+          const cur = JSON.parse(localStorage.getItem(STORE_KEY+'_recent')||'[]');
+          const next = cur.filter(x => x !== id);
+          localStorage.setItem(STORE_KEY+'_recent', JSON.stringify(next));
+          row.remove();
+          if(!list.children.length){
+            const card = document.getElementById('recent-card');
+            if(card) card.remove();
+          }
+        }}, '✕');
+      row.appendChild(info);
+      row.appendChild(del);
+      list.appendChild(row);
+    });
+    recentCard.appendChild(list);
+    main.appendChild(recentCard);
   }
+  renderRecentCard();
 
   const back = el('div',{style:{marginTop:'1rem',textAlign:'center'}},
     el('button',{class:'btn secondary',onclick:()=>go('#welcome')},'← Back'));
@@ -2285,6 +2358,218 @@ function adminCleaning(main){
 }
 
 function adminImport(main){
+  /* ─── Import tabs ─────────────────────────────────────────── */
+  const importTabState = {active: 'master'};
+  const tabBar = el('div',{class:'toggle-group',style:{marginBottom:'1rem'}});
+  const tabMaster = el('button',{class:'on'},  'Master Roster');
+  const tabLeave  = el('button',{class:''},    'Approved Leave');
+  const tabPrev   = el('button',{class:''},    'Previous Months');
+  tabBar.append(tabMaster, tabLeave, tabPrev);
+  main.appendChild(tabBar);
+
+  const masterPanel = el('div');
+  const leavePanel  = el('div',{class:'hide'});
+  const prevPanel   = el('div',{class:'hide'});
+  main.appendChild(masterPanel);
+  main.appendChild(leavePanel);
+  main.appendChild(prevPanel);
+
+  function switchImportTab(name){
+    importTabState.active = name;
+    tabMaster.className = name==='master'?'on':'';
+    tabLeave.className  = name==='leave'?'on':'';
+    tabPrev.className   = name==='prev'?'on':'';
+    masterPanel.className = name==='master' ? '' : 'hide';
+    leavePanel.className  = name==='leave'  ? '' : 'hide';
+    prevPanel.className   = name==='prev'   ? '' : 'hide';
+  }
+  tabMaster.onclick = ()=>switchImportTab('master');
+  tabLeave.onclick  = ()=>switchImportTab('leave');
+  tabPrev.onclick   = ()=>switchImportTab('prev');
+
+  // ── Approved Leave panel ─────────────────────────────────────
+  (function buildLeavePanel(){
+    const p = leavePanel;
+    const card = el('div',{class:'card'});
+    card.appendChild(el('h2',null,'Upload Approved Leave sheet'));
+    card.appendChild(el('div',{class:'note'},'Upload an .xlsx containing pre-approved leave dates. ' +
+      'Expected columns: Instructor Name, Start Date, End Date, Leave Type, Notes. ' +
+      'This data is merged into leave tracking and visible in department chair views.'));
+    const dropzone = el('div',{style:{
+      border:'2px dashed var(--border)',borderRadius:'var(--radius)',padding:'2rem',
+      textAlign:'center',cursor:'pointer',marginTop:'.75rem',background:'var(--surface-2)'
+    }}, 'Drag & drop .xlsx here or click to browse');
+    const fileIn = el('input',{type:'file',accept:'.xlsx,.xls',style:{display:'none'}});
+    dropzone.onclick = ()=>fileIn.click();
+    dropzone.addEventListener('dragover',e=>{e.preventDefault();dropzone.style.borderColor='var(--primary)';});
+    dropzone.addEventListener('dragleave',()=>{dropzone.style.borderColor='';});
+    dropzone.addEventListener('drop',e=>{
+      e.preventDefault();dropzone.style.borderColor='';
+      const file=e.dataTransfer.files[0]; if(file) processLeaveFile(file);
+    });
+    fileIn.addEventListener('change',e=>{const f=e.target.files[0];if(f)processLeaveFile(f);});
+    const status = el('div',{class:'muted',style:{marginTop:'.5rem',fontSize:'.88rem'}});
+    card.appendChild(dropzone); card.appendChild(fileIn); card.appendChild(status);
+    p.appendChild(card);
+
+    // Show currently imported approved leave count
+    const summary = el('div',{class:'card'});
+    function updateLeaveSummary(){
+      clear(summary);
+      const rows = State.approvedLeaveImported||[];
+      summary.appendChild(el('h3',null,'Currently imported'));
+      summary.appendChild(el('div',{class:'muted',style:{fontSize:'.9rem'}},
+        rows.length ? rows.length+' approved leave record(s) loaded.' : 'No approved leave sheet uploaded yet.'));
+      if(rows.length){
+        const ul = el('ul',{style:{fontSize:'.85rem',marginTop:'.4rem'}});
+        rows.slice(0,8).forEach(r=>ul.appendChild(el('li',null,
+          (r.name||'?')+' — '+(r.start||'?')+' → '+(r.end||'?')+(r.type?' ('+r.type+')':''))));
+        if(rows.length>8) ul.appendChild(el('li',null,'… and '+(rows.length-8)+' more'));
+        summary.appendChild(ul);
+        summary.appendChild(el('button',{class:'btn danger small',style:{marginTop:'.5rem'},onclick:()=>{
+          State.approvedLeaveImported=[];toast('Approved leave cleared','ok');updateLeaveSummary();
+        }},'Clear imported leave'));
+      }
+    }
+    updateLeaveSummary();
+    p.appendChild(summary);
+
+    async function processLeaveFile(file){
+      status.textContent='Loading Excel parser…';
+      try{
+        await ensureSheetJs();
+        status.textContent='Parsing '+file.name+'…';
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf,{cellDates:true});
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws,{defval:''});
+        const parsed = rows.map(r=>{
+          const keys = Object.keys(r).map(k=>k.toLowerCase().trim());
+          const get = (pat)=>{
+            const k = Object.keys(r).find(k=>pat.test(k.toLowerCase()));
+            return k ? String(r[k]||'').trim() : '';
+          };
+          return {
+            name: get(/name|instructor/),
+            start: get(/start/),
+            end: get(/end/),
+            type: get(/type|leave type/),
+            notes: get(/note/),
+          };
+        }).filter(r=>r.name);
+        State.approvedLeaveImported = parsed;
+        // Merge into leave_requests as 'approved' records where instructor matches
+        let merged = 0;
+        for(const row of parsed){
+          const inst = State.data.instructors.find(i=>
+            i.full_name && i.full_name.toLowerCase().includes(row.name.toLowerCase().split(' ')[0].toLowerCase())
+          );
+          if(inst && row.start && row.end){
+            // Check for duplicate
+            const exists = (State.data.leave_requests||[]).find(lr=>
+              lr.instructor_id===inst.instructor_id && lr.start_date===row.start && lr.source==='approved_leave_import');
+            if(!exists){
+              const rec = {
+                request_id:'alv_'+Math.random().toString(36).slice(2,10),
+                instructor_id: inst.instructor_id,
+                leave_type: row.type||'Approved Leave',
+                start_date: row.start,
+                end_date: row.end,
+                reason: row.notes||'Imported from approved leave sheet',
+                status:'approved',
+                submitted_at: new Date().toISOString(),
+                decided_at: new Date().toISOString(),
+                decided_by:'Approved Leave Import',
+                coordinator_note:'',
+                source:'approved_leave_import',
+              };
+              State.data.leave_requests.push(rec);
+              merged++;
+            }
+          }
+        }
+        await persist();
+        status.textContent='Imported '+parsed.length+' records, matched '+merged+' to instructors from '+file.name+'.';
+        toast('Approved leave imported','ok');
+        updateLeaveSummary();
+        fileIn.value='';
+      }catch(err){status.textContent='Import failed: '+(err.message||err);toast('Import failed','err');}
+    }
+  })();
+
+  // ── Previous Months panel ─────────────────────────────────────
+  (function buildPrevPanel(){
+    const p = prevPanel;
+    const card = el('div',{class:'card'});
+    card.appendChild(el('h2',null,'Upload Previous Months sheet'));
+    card.appendChild(el('div',{class:'note'},'Upload an .xlsx containing historical roster data. ' +
+      'This is stored separately and does not overwrite the current active roster. ' +
+      'It is accessible for historical reference.'));
+    const dropzone = el('div',{style:{
+      border:'2px dashed var(--border)',borderRadius:'var(--radius)',padding:'2rem',
+      textAlign:'center',cursor:'pointer',marginTop:'.75rem',background:'var(--surface-2)'
+    }}, 'Drag & drop .xlsx here or click to browse');
+    const fileIn = el('input',{type:'file',accept:'.xlsx,.xls',style:{display:'none'}});
+    dropzone.onclick = ()=>fileIn.click();
+    dropzone.addEventListener('dragover',e=>{e.preventDefault();dropzone.style.borderColor='var(--primary)';});
+    dropzone.addEventListener('dragleave',()=>{dropzone.style.borderColor='';});
+    dropzone.addEventListener('drop',e=>{
+      e.preventDefault();dropzone.style.borderColor='';
+      const file=e.dataTransfer.files[0]; if(file) processPrevFile(file);
+    });
+    fileIn.addEventListener('change',e=>{const f=e.target.files[0];if(f)processPrevFile(f);});
+    const status = el('div',{class:'muted',style:{marginTop:'.5rem',fontSize:'.88rem'}});
+    card.appendChild(dropzone); card.appendChild(fileIn); card.appendChild(status);
+    p.appendChild(card);
+
+    const summary = el('div',{class:'card'});
+    function updatePrevSummary(){
+      clear(summary);
+      const pd = State.prevMonthsData;
+      summary.appendChild(el('h3',null,'Currently stored'));
+      if(!pd){
+        summary.appendChild(el('div',{class:'muted',style:{fontSize:'.9rem'}},'No previous months data uploaded yet.'));
+      } else {
+        summary.appendChild(el('div',{class:'kpi-grid'},
+          kpi(pd.instructors||0,'Instructors'),
+          kpi(pd.activities||0,'Activities'),
+          kpi(pd.assignments||0,'Assignments'),
+        ));
+        summary.appendChild(el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.4rem'}},
+          'Source: '+(pd.source||'unknown')+' · Imported: '+(pd.importedAt||'?')));
+        summary.appendChild(el('button',{class:'btn danger small',style:{marginTop:'.5rem'},onclick:()=>{
+          State.prevMonthsData=null;persist();toast('Previous months data cleared','ok');updatePrevSummary();
+        }},'Clear previous months data'));
+      }
+    }
+    updatePrevSummary();
+    p.appendChild(summary);
+
+    async function processPrevFile(file){
+      status.textContent='Loading Excel parser…';
+      try{
+        await ensureSheetJs();
+        status.textContent='Parsing '+file.name+'…';
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf,{cellDates:true});
+        const parsed = parseWorkbook(wb);
+        State.prevMonthsData = {
+          data: parsed,
+          source: file.name,
+          importedAt: new Date().toLocaleString(),
+          instructors: parsed.instructors.length,
+          activities: parsed.master_schedule.length,
+          assignments: parsed.assignments.length,
+        };
+        await persist();
+        status.textContent='Stored '+parsed.instructors.length+' instructors, '+parsed.master_schedule.length+' activities from '+file.name+' (reference only — active data unchanged).';
+        toast('Previous months stored','ok');
+        updatePrevSummary();
+        fileIn.value='';
+      }catch(err){status.textContent='Import failed: '+(err.message||err);toast('Import failed','err');}
+    }
+  })();
+
 
   /* ─── 1. Fetch from published JSON URL ─────────────────────── */
   const urlCard = el('div',{class:'card'});
@@ -2347,7 +2632,7 @@ function adminImport(main){
     window.open(urlInput.value.trim(),'_blank');
   }},'Open URL (test)'));
   urlCard.appendChild(urlBtns);
-  main.appendChild(urlCard);
+  masterPanel.appendChild(urlCard);
 
   /* ─── 2. Upload Excel workbook manually ─────────────────────── */
   const xlsCard = el('div',{class:'card'});
@@ -2391,7 +2676,7 @@ function adminImport(main){
       setTimeout(()=>location.reload(), 700);
     }catch(err){ uploadStatus.textContent='Import failed: '+(err.message||err); toast('Import failed','err'); }
   });
-  main.appendChild(xlsCard);
+  masterPanel.appendChild(xlsCard);
 
   /* ─── 3. Upload JSON backup ──────────────────────────────────── */
   const jsonCard = el('div',{class:'card'});
@@ -2427,7 +2712,7 @@ function adminImport(main){
       setTimeout(()=>location.reload(), 700);
     }catch(err){ jsonStatus.textContent='Import failed: '+(err.message||err); jsonStatus.className='note err'; toast('JSON import failed','err'); }
   });
-  main.appendChild(jsonCard);
+  masterPanel.appendChild(jsonCard);
 
   /* ─── 4. Current data snapshot ───────────────────────────────── */
   const current = el('div',{class:'card'});
@@ -2447,7 +2732,7 @@ function adminImport(main){
     current.appendChild(el('div',{class:'muted',style:{fontSize:'.82rem',marginTop:'.3rem'}},
       'Sample names: '+sample));
   }
-  main.appendChild(current);
+  masterPanel.appendChild(current);
 
   /* ─── 5. Reset ───────────────────────────────────────────────── */
   const reset = el('div',{class:'card'});
@@ -2460,7 +2745,301 @@ function adminImport(main){
     if(!confirm('Clear local data and reset to embedded seed?')) return;
     await Storage.clear(); location.reload();
   }},'Clear cache & reload'));
-  main.appendChild(reset);
+  masterPanel.appendChild(reset);
+}
+
+/* -------- DEPARTMENT CHAIR VIEW ----------------------- */
+function renderDeptChairView(dept){
+  State.view = 'deptchair';
+  setSubtitle();
+  renderTabs([]);
+  const main = document.getElementById('main');
+  clear(main);
+
+  const header = el('div',{class:'card'});
+  header.appendChild(el('h2',null, dept+' — Department Chair'));
+  header.appendChild(el('button',{class:'btn secondary small',onclick:()=>go('#welcome')}, '← Back'));
+  main.appendChild(header);
+
+  // Normalize dept name for matching (handle "Micro Pharm" / "Micro Immuno Pharm" variants)
+  const DEPT_ALIASES = {
+    'Microbiology-Pharmacology': ['micro','pharm','micro pharm','micro immuno pharm','microbiology','microbiology-pharmacology'],
+    'Clinical Skills': ['clinical skills'],
+    'Pathology': ['pathology'],
+    'Pathophysiology': ['pathophysiology'],
+  };
+  const aliases = DEPT_ALIASES[dept] || [dept.toLowerCase()];
+  const deptInstructors = State.data.instructors.filter(i => {
+    const d = (i.department||'').toLowerCase();
+    return aliases.some(a => d.includes(a));
+  });
+
+  if(!deptInstructors.length){
+    main.appendChild(el('div',{class:'note warn'},
+      'No instructors found for department "'+dept+'". Check that department names in the roster match.'));
+    return;
+  }
+
+  // KPI summary
+  const report = buildAttendanceReport().filter(r => {
+    const inst = instructorById(r.instructor_id);
+    if(!inst) return false;
+    const d = (inst.department||'').toLowerCase();
+    return aliases.some(a => d.includes(a));
+  });
+  const ks = el('div',{class:'kpi-grid'});
+  ks.appendChild(kpi(deptInstructors.length, 'Instructors'));
+  ks.appendChild(kpi(report.reduce((s,r)=>s+r.total_days,0), 'Total absences', 'warn'));
+  ks.appendChild(kpi(report.reduce((s,r)=>s+r.unexcused_days,0), 'Unexcused (Absent)', 'err'));
+  ks.appendChild(kpi(report.reduce((s,r)=>s+r.excused_days,0), 'eAbsent (notified)'));
+  main.appendChild(ks);
+
+  // Absence summary table
+  const absCard = el('div',{class:'card'});
+  absCard.appendChild(el('h2',null,'Absence Summary'));
+  absCard.appendChild(el('div',{class:'note',style:{marginBottom:'.6rem'}},
+    el('strong',null,'eAbsent'), ': instructor notified coordinator via email but was absent. ',
+    el('strong',null,'Absent'), ': absent with no prior notification.'));
+  const tbl = el('table',{class:'tbl'});
+  tbl.appendChild(el('tr',{},
+    ...['Instructor','eAbsent days','Absent days','Total'].map(h=>el('th',{},h))
+  ));
+  report.forEach(r => {
+    const sev = r.total_days >= 5 ? 'red' : r.total_days >= 3 ? 'yellow' : r.total_days ? 'gray' : 'green';
+    tbl.appendChild(el('tr',{style:{cursor:'pointer'},onclick:()=>showDeptInstructorDetail(r,dept)},
+      el('td',{},r.full_name),
+      el('td',{},el('span',{class:'badge blue'},String(r.excused_days))),
+      el('td',{},el('span',{class:'badge '+(r.unexcused_days?'red':'gray')},String(r.unexcused_days))),
+      el('td',{},el('span',{class:'badge '+sev},String(r.total_days)))
+    ));
+  });
+  absCard.appendChild(el('div',{class:'tbl-wrap'},tbl));
+  main.appendChild(absCard);
+
+  // Leave information
+  const leaveCard = el('div',{class:'card'});
+  leaveCard.appendChild(el('h2',null,'Leave Records'));
+  const leaveRows = (State.data.leave_requests||[]).filter(lr => {
+    const inst = instructorById(lr.instructor_id);
+    if(!inst) return false;
+    const d = (inst.department||'').toLowerCase();
+    return aliases.some(a => d.includes(a));
+  }).sort((a,b)=>String(a.start_date).localeCompare(String(b.start_date)));
+
+  if(!leaveRows.length){
+    leaveCard.appendChild(el('div',{class:'empty'},'No leave records for this department.'));
+  } else {
+    const list = el('div',{class:'list'});
+    leaveRows.forEach(lr => {
+      const inst = instructorById(lr.instructor_id)||{};
+      const statusColor = lr.status==='approved'?'green':lr.status==='rejected'?'red':'yellow';
+      list.appendChild(el('div',{class:'item'},
+        el('div',{class:'item-head'},
+          el('div',{class:'item-title'},inst.full_name||lr.instructor_id),
+          el('span',{class:'badge '+statusColor},lr.status)
+        ),
+        el('div',{class:'meta'},
+          el('span',null,lr.leave_type||'Leave'),
+          el('span',null,(lr.start_date||'?')+' → '+(lr.end_date||'?')),
+          el('span',null,lr.source==='approved_leave_import'?'Approved leave sheet':
+             lr.source==='app'?'Instructor request':'Imported')
+        ),
+        lr.reason ? el('div',{style:{fontSize:'.85rem',color:'var(--text-dim)',marginTop:'.2rem'}},lr.reason) : null
+      ));
+    });
+    leaveCard.appendChild(list);
+  }
+  main.appendChild(leaveCard);
+
+  // Individual instructor calendars
+  const calCard = el('div',{class:'card'});
+  calCard.appendChild(el('h2',null,'Instructor Calendars'));
+  const instSel = el('select',{},
+    ...deptInstructors.map(i=>el('option',{value:i.instructor_id},i.full_name))
+  );
+  calCard.appendChild(instSel);
+  const calGrid = el('div',{style:{marginTop:'.75rem'}});
+  calCard.appendChild(calGrid);
+
+  function drawDeptCal(){
+    clear(calGrid);
+    const inst = instructorById(instSel.value);
+    if(!inst){ calGrid.appendChild(el('div',{class:'empty'},'Select an instructor.')); return; }
+    const allDates = [
+      ...assignmentsForInstructor(inst.instructor_id).map(a=>a.date).filter(Boolean),
+      ...reviewsForInstructor(inst.instructor_id).map(r=>r.review_date).filter(Boolean),
+    ];
+    const months = [...new Set(allDates.map(monthOf))].sort();
+    if(!months.length){ calGrid.appendChild(el('div',{class:'empty'},'No dated activities.')); return; }
+    const mSel = el('select',{},...months.map(m=>el('option',{value:m},monthLabel(m))));
+    const now = new Date().toISOString().slice(0,7);
+    mSel.value = months.includes(now)?now:months[0];
+    const calWrap = el('div');
+    function drawCal(){
+      clear(calWrap);
+      calWrap.appendChild(buildMonthCalendar(mSel.value,{
+        assignments:assignmentsForInstructor(inst.instructor_id),
+        reviews:reviewsForInstructor(inst.instructor_id),
+        conflicts:detectConflicts({onlyInstructor:inst.instructor_id}).map(c=>c.date),
+      }));
+    }
+    mSel.addEventListener('change',drawCal);
+    calGrid.appendChild(mSel);
+    calGrid.appendChild(calWrap);
+    drawCal();
+  }
+  instSel.addEventListener('change',drawDeptCal);
+  drawDeptCal();
+  main.appendChild(calCard);
+}
+
+function showDeptInstructorDetail(r, dept){
+  const body = el('div',{});
+  body.appendChild(el('div',{class:'meta'},
+    el('span',null,dept),
+    el('span',null,r.email||''),
+    el('span',null,r.total_days+' day(s) total')
+  ));
+  if(r.dates_excused.length){
+    body.appendChild(el('h3',null,'eAbsent (notified) — '+r.dates_excused.length+' day(s)'));
+    const ul=el('ul'); r.dates_excused.forEach(d=>ul.appendChild(el('li',null,fmtDateLong(d)))); body.appendChild(ul);
+  }
+  if(r.dates_unexcused.length){
+    body.appendChild(el('h3',null,'Absent (no notification) — '+r.dates_unexcused.length+' day(s)'));
+    const ul=el('ul'); r.dates_unexcused.forEach(d=>ul.appendChild(el('li',null,fmtDateLong(d)))); body.appendChild(ul);
+  }
+  if(!r.dates_excused.length && !r.dates_unexcused.length)
+    body.appendChild(el('div',{class:'empty'},'No absences on record.'));
+  modal(r.full_name, body, [el('button',{class:'btn',onclick:closeModal},'Close')]);
+}
+
+/* -------- SUPERVISING FACULTY VIEW -------------------- */
+function renderSupervisingFacultyView(){
+  State.view = 'supervising';
+  setSubtitle();
+  renderTabs([]);
+  const main = document.getElementById('main');
+  clear(main);
+
+  const header = el('div',{class:'card'});
+  header.appendChild(el('h2',null,'Supervising Faculty'));
+  header.appendChild(el('div',{class:'muted',style:{fontSize:'.9rem',marginTop:'.3rem'}},
+    'Select a small group activity to see assigned instructors and find the best meeting time.'));
+  header.appendChild(el('button',{class:'btn secondary small',style:{marginTop:'.6rem'},onclick:()=>go('#welcome')}, '← Back'));
+  main.appendChild(header);
+
+  // Get all SG activities
+  const sgActivities = State.data.master_schedule.filter(a => /SG|SGP/i.test(a.activity_type||''));
+  if(!sgActivities.length){
+    main.appendChild(el('div',{class:'note warn'},'No Small Group activities found in the current roster.'));
+    return;
+  }
+
+  // Deduplicate by activity name
+  const seen = new Set();
+  const uniqueSG = sgActivities.filter(a => {
+    const key = a.activity_name||a.activity_id;
+    if(seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+
+  const selCard = el('div',{class:'card'});
+  selCard.appendChild(el('h3',null,'Select Small Group Activity'));
+  const sgSel = el('select',{style:{marginBottom:'.6rem'}},
+    el('option',{value:''},'— Choose an activity —'),
+    ...uniqueSG.map(a=>el('option',{value:a.activity_id||a.activity_name},
+      (a.activity_name||a.activity_id)+' ('+(a.date||'no date')+')'))
+  );
+  selCard.appendChild(sgSel);
+  const sgResult = el('div');
+  selCard.appendChild(sgResult);
+  main.appendChild(selCard);
+
+  sgSel.addEventListener('change',()=>{
+    clear(sgResult);
+    const key = sgSel.value; if(!key) return;
+    const activity = sgActivities.find(a=>(a.activity_id||a.activity_name)===key);
+    if(!activity) return;
+
+    // Find all assignments for this activity (or activities with same name)
+    const actName = activity.activity_name;
+    const sameNameActs = sgActivities.filter(a=>a.activity_name===actName);
+    const actIds = new Set(sameNameActs.map(a=>a.activity_id));
+    const assignedIds = [...new Set(
+      State.data.assignments.filter(a=>actIds.has(a.activity_id)).map(a=>a.instructor_id)
+    )];
+    const assignedInstructors = assignedIds.map(id=>instructorById(id)).filter(Boolean);
+
+    sgResult.appendChild(el('h3',null,'Assigned Instructors ('+assignedInstructors.length+')'));
+    if(!assignedInstructors.length){
+      sgResult.appendChild(el('div',{class:'empty'},'No instructors assigned to this activity.'));
+      return;
+    }
+    const list = el('div',{class:'list'});
+    assignedInstructors.forEach(i=>list.appendChild(el('div',{class:'item'},
+      el('div',{class:'item-title'},i.full_name),
+      el('div',{class:'meta'},el('span',null,i.department||''),el('span',null,i.email||''))
+    )));
+    sgResult.appendChild(list);
+
+    // Find best meeting times: dates where majority of assigned instructors are free
+    const months = getAppScheduleMonths();
+    if(!months.length || !assignedIds.length) return;
+
+    // Build busy map: instructorId → Set of dates busy
+    const busyMap = {};
+    assignedIds.forEach(id=>{
+      const dates = new Set([
+        ...assignmentsForInstructor(id).map(a=>a.date).filter(Boolean),
+        ...reviewsForInstructor(id).map(r=>r.review_date).filter(Boolean),
+      ]);
+      busyMap[id] = dates;
+    });
+
+    // Check each working day in the schedule months
+    const freeSlots = [];
+    for(const ym of months){
+      const [y,m] = ym.split('-').map(Number);
+      const daysInMonth = new Date(y,m,0).getDate();
+      for(let day=1;day<=daysInMonth;day++){
+        const ds = y+'-'+String(m).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+        const dow = new Date(ds+'T12:00:00').getDay();
+        if(dow===0||dow===6) continue; // skip weekends
+        const freeCount = assignedIds.filter(id=>!(busyMap[id]||new Set()).has(ds)).length;
+        const pct = Math.round(100*freeCount/assignedIds.length);
+        if(freeCount > assignedIds.length/2){ // majority free
+          freeSlots.push({date:ds, freeCount, total:assignedIds.length, pct});
+        }
+      }
+    }
+
+    sgResult.appendChild(el('h3',null,'Suggested Meeting Times'));
+    if(!freeSlots.length){
+      sgResult.appendChild(el('div',{class:'note warn'},'No date found where the majority of instructors are free simultaneously.'));
+      return;
+    }
+    // Sort by most free, then by date
+    freeSlots.sort((a,b)=>b.pct-a.pct||a.date.localeCompare(b.date));
+    const top = freeSlots.slice(0,10);
+    const best = top[0];
+    const ftbl = el('table',{class:'tbl'});
+    ftbl.appendChild(el('tr',{},...['Date','Free','Busy','% Free'].map(h=>el('th',{},h))));
+    top.forEach((s,i)=>{
+      const isTop = i===0;
+      const tr = el('tr',{style:isTop?{background:'var(--green-soft)'}:{}},
+        el('td',{},fmtDateLong(s.date)+(isTop?' ⭐ Best':'') ),
+        el('td',{},String(s.freeCount)),
+        el('td',{},String(s.total-s.freeCount)),
+        el('td',{},el('span',{class:'badge '+(s.pct>=80?'green':s.pct>=60?'yellow':'gray')},s.pct+'%'))
+      );
+      ftbl.appendChild(tr);
+    });
+    sgResult.appendChild(el('div',{class:'tbl-wrap'},ftbl));
+    sgResult.appendChild(el('div',{class:'note',style:{marginTop:'.6rem'}},
+      el('strong',null,'Best option: '),
+      fmtDateLong(best.date)+' — '+best.freeCount+' of '+best.total+' instructors are free ('+best.pct+'%).'
+    ));
+  });
 }
 
 function adminExport(main){
