@@ -325,6 +325,8 @@ const State = {
     lastSyncedAt: null,
     lastSyncError: '',
     coordinatorEmail: 'clinicaltutorsyear2@sgu.edu',
+    deptPasscodes: {},        // overrides for dept chair passwords (keyed by dept name)
+    supervisingPasscode: '',  // override for supervising faculty password
   },
   overrides: {},     // { issue_key: {resolved:true, note:""} }
   approvedLeaveImported: [],  // approved leave from "Approved Leave" sheet upload
@@ -565,6 +567,15 @@ async function bootstrap(){
       }
     } else {
       State.data = d;
+      // Always sync schedule_months and sheets_seen from the embedded seed so
+      // the calendar reflects the current file even when using cached data.
+      const seed = getSeed();
+      if(seed && seed.meta){
+        if(seed.meta.schedule_months && seed.meta.schedule_months.length)
+          State.data.meta.schedule_months = seed.meta.schedule_months;
+        if(seed.meta.sheets_seen && seed.meta.sheets_seen.length)
+          State.data.meta.sheets_seen = seed.meta.sheets_seen;
+      }
     }
     State.settings = Object.assign(State.settings, persisted.settings || {});
     State.me = persisted.me || null;
@@ -780,6 +791,7 @@ const ROUTES = {
   '#admin/cleaning': () => renderAdminView('cleaning'),
   '#admin/export': () => renderAdminView('export'),
   '#admin/settings': () => renderAdminView('settings'),
+  '#admin/passwords': () => renderAdminView('passwords'),
   '#deptchair/micro': () => renderDeptChairView('Microbiology-Pharmacology'),
   '#deptchair/skills': () => renderDeptChairView('Clinical Skills'),
   '#deptchair/path': () => renderDeptChairView('Pathology'),
@@ -891,7 +903,8 @@ function requireDeptChair(dept, then){
   modal(dept+' — Chair Sign-in', [input], [
     el('button',{class:'btn secondary',onclick:closeModal}, 'Cancel'),
     el('button',{class:'btn',onclick:()=>{
-      if(input.value === DEPT_PASSCODES[dept]){ closeModal(); then(); }
+      const effective = (State.settings.deptPasscodes&&State.settings.deptPasscodes[dept]) || DEPT_PASSCODES[dept];
+      if(input.value === effective){ closeModal(); then(); }
       else toast('Incorrect passcode','err');
     }}, 'Continue')
   ]);
@@ -902,7 +915,8 @@ function requireSupervisingFaculty(then){
   modal('Supervising Faculty Sign-in', [input], [
     el('button',{class:'btn secondary',onclick:closeModal}, 'Cancel'),
     el('button',{class:'btn',onclick:()=>{
-      if(input.value === SUPERVISING_PASSCODE){ closeModal(); then(); }
+      const effective = State.settings.supervisingPasscode || SUPERVISING_PASSCODE;
+      if(input.value === effective){ closeModal(); then(); }
       else toast('Incorrect passcode','err');
     }}, 'Continue')
   ]);
@@ -1867,6 +1881,7 @@ function renderAdminView(tab){
     {id:'cleaning',label:'Data cleaning',go:()=>go('#admin/cleaning')},
     {id:'import',label:'Import',go:()=>go('#admin/import')},
     {id:'export',label:'Export',go:()=>go('#admin/export')},
+    {id:'passwords',label:'Passwords',go:()=>go('#admin/passwords')},
     {id:'settings',label:'Settings',go:()=>go('#admin/settings')},
   ]);
   const main = document.getElementById('main'); clear(main);
@@ -1878,6 +1893,7 @@ function renderAdminView(tab){
   else if(State.tab==='cleaning') adminCleaning(main);
   else if(State.tab==='import') adminImport(main);
   else if(State.tab==='export') adminExport(main);
+  else if(State.tab==='passwords') adminPasswords(main);
   else if(State.tab==='settings') adminSettings(main);
 }
 
@@ -2935,20 +2951,23 @@ function renderSupervisingFacultyView(){
     return;
   }
 
-  // Deduplicate by activity name
-  const seen = new Set();
-  const uniqueSG = sgActivities.filter(a => {
-    const key = a.activity_name||a.activity_id;
-    if(seen.has(key)) return false;
-    seen.add(key); return true;
+  // Strip cohort suffix like "(A)", "(B)", "(C)", "(D)" to get the base SG name
+  function baseSgName(name){ return (name||'').replace(/\s*\([A-Z]\)\s*$/,'').trim(); }
+
+  // Deduplicate by BASE name (merges cohort variants into one entry)
+  const seenBase = new Set();
+  const uniqueSG = [];
+  sgActivities.forEach(a => {
+    const base = baseSgName(a.activity_name||a.activity_id);
+    if(!seenBase.has(base)){ seenBase.add(base); uniqueSG.push({baseName: base, sample: a}); }
   });
+  uniqueSG.sort((a,b)=>a.baseName.localeCompare(b.baseName));
 
   const selCard = el('div',{class:'card'});
   selCard.appendChild(el('h3',null,'Select Small Group Activity'));
   const sgSel = el('select',{style:{marginBottom:'.6rem'}},
     el('option',{value:''},'— Choose an activity —'),
-    ...uniqueSG.map(a=>el('option',{value:a.activity_id||a.activity_name},
-      (a.activity_name||a.activity_id)+' ('+(a.date||'no date')+')'))
+    ...uniqueSG.map(g=>el('option',{value:g.baseName}, g.baseName))
   );
   selCard.appendChild(sgSel);
   const sgResult = el('div');
@@ -2957,13 +2976,10 @@ function renderSupervisingFacultyView(){
 
   sgSel.addEventListener('change',()=>{
     clear(sgResult);
-    const key = sgSel.value; if(!key) return;
-    const activity = sgActivities.find(a=>(a.activity_id||a.activity_name)===key);
-    if(!activity) return;
+    const baseName = sgSel.value; if(!baseName) return;
 
-    // Find all assignments for this activity (or activities with same name)
-    const actName = activity.activity_name;
-    const sameNameActs = sgActivities.filter(a=>a.activity_name===actName);
+    // Find ALL cohort variants (A/B/C/D and the base) with this base name
+    const sameNameActs = sgActivities.filter(a=>baseSgName(a.activity_name||'')===baseName);
     const actIds = new Set(sameNameActs.map(a=>a.activity_id));
     const assignedIds = [...new Set(
       State.data.assignments.filter(a=>actIds.has(a.activity_id)).map(a=>a.instructor_id)
@@ -3120,6 +3136,107 @@ function adminExport(main){
     downloadFile(`${inst.full_name.replace(/\s+/g,'_')}_schedule.csv`, toCSV(['Date','Start','End','Activity','Location','Role'], rows), 'text/csv');
   }},'Download'));
   main.appendChild(card2);
+}
+
+function adminPasswords(main){
+  const card = el('div',{class:'card'});
+  card.appendChild(el('h2',null,'Manage Role Passwords'));
+  card.appendChild(el('div',{class:'note',style:{marginBottom:'.8rem'}},
+    'Set custom passwords for each role below. Leave a field blank to keep using the built-in default. ' +
+    'Changes are saved to this device — anyone using a different browser will still see the defaults until you update those too.'));
+
+  const fields = {};
+  const depts = Object.keys(DEPT_PASSCODES);
+
+  // Dept chair fields
+  card.appendChild(el('h3',null,'Department Chair Passwords'));
+  depts.forEach(dept => {
+    const current = (State.settings.deptPasscodes&&State.settings.deptPasscodes[dept]) || '';
+    const inp = el('input',{type:'password',
+      placeholder:'Default: '+DEPT_PASSCODES[dept],
+      value: current,
+      autocomplete:'new-password'});
+    fields[dept] = inp;
+    card.appendChild(el('label',{style:{display:'block',marginBottom:'.5rem'}},
+      el('div',{class:'muted',style:{fontSize:'.85rem',marginBottom:'.2rem'}}, dept),
+      inp
+    ));
+  });
+
+  // Supervising faculty field
+  card.appendChild(el('h3',{style:{marginTop:'.8rem'}},null,'Supervising Faculty Password'));
+  const supInp = el('input',{type:'password',
+    placeholder:'Default: '+SUPERVISING_PASSCODE,
+    value: State.settings.supervisingPasscode||'',
+    autocomplete:'new-password'});
+  card.appendChild(el('label',{style:{display:'block',marginBottom:'.5rem'}},
+    el('div',{class:'muted',style:{fontSize:'.85rem',marginBottom:'.2rem'}},'Supervising Faculty'),
+    supInp
+  ));
+
+  // Show/hide toggle
+  const showToggle = el('label',{style:{display:'flex',gap:'.4rem',alignItems:'center',marginTop:'.4rem',fontSize:'.88rem',color:'var(--text-dim)'}});
+  const showChk = el('input',{type:'checkbox'});
+  showChk.addEventListener('change',()=>{
+    const t = showChk.checked ? 'text' : 'password';
+    Object.values(fields).forEach(f=>f.type=t);
+    supInp.type = t;
+  });
+  showToggle.appendChild(showChk);
+  showToggle.appendChild(document.createTextNode(' Show passwords'));
+  card.appendChild(showToggle);
+
+  card.appendChild(el('div',{style:{marginTop:'.75rem',display:'flex',gap:'.5rem',flexWrap:'wrap'}},
+    el('button',{class:'btn',onclick:async()=>{
+      if(!State.settings.deptPasscodes) State.settings.deptPasscodes = {};
+      depts.forEach(dept=>{
+        const v = fields[dept].value.trim();
+        if(v) State.settings.deptPasscodes[dept] = v;
+        else delete State.settings.deptPasscodes[dept];
+      });
+      State.settings.supervisingPasscode = supInp.value.trim();
+      await persist();
+      toast('Passwords saved','ok');
+    }},'Save passwords'),
+    el('button',{class:'btn secondary',onclick:async()=>{
+      if(!confirm('Reset all role passwords to their built-in defaults?')) return;
+      State.settings.deptPasscodes = {};
+      State.settings.supervisingPasscode = '';
+      await persist();
+      Object.values(fields).forEach(f=>f.value='');
+      supInp.value='';
+      toast('Passwords reset to defaults','ok');
+    }},'Reset to defaults')
+  ));
+
+  main.appendChild(card);
+
+  // Current effective passwords summary
+  const summary = el('div',{class:'card'});
+  summary.appendChild(el('h3',null,'Current effective passwords'));
+  summary.appendChild(el('div',{class:'note warn',style:{marginBottom:'.6rem'}},
+    'These are the passwords currently in effect on this device. Share them securely.'));
+  const tbl = el('table',{class:'tbl'});
+  tbl.appendChild(el('tr',{},...['Role','Password'].map(h=>el('th',{},h))));
+  depts.forEach(dept=>{
+    const pw = (State.settings.deptPasscodes&&State.settings.deptPasscodes[dept]) || DEPT_PASSCODES[dept];
+    tbl.appendChild(el('tr',{},
+      el('td',{},dept+' Chair'),
+      el('td',{},el('span',{class:'kbd'},pw))
+    ));
+  });
+  const supPw = State.settings.supervisingPasscode || SUPERVISING_PASSCODE;
+  tbl.appendChild(el('tr',{},
+    el('td',{},'Supervising Faculty'),
+    el('td',{},el('span',{class:'kbd'},supPw))
+  ));
+  const coordPw = State.settings.passcode || DEFAULT_PASSCODE;
+  tbl.appendChild(el('tr',{},
+    el('td',{},'Coordinator (set in Settings tab)'),
+    el('td',{},el('span',{class:'kbd'},coordPw))
+  ));
+  summary.appendChild(el('div',{class:'tbl-wrap'},tbl));
+  main.appendChild(summary);
 }
 
 function adminSettings(main){
