@@ -3819,6 +3819,10 @@ function parseWorkbook(wb){
     let lastDate='', lastCourse='', lastSession='', lastVenue='', firstDate=null;
     const ncols = Math.max(rows[DATE_ROW]?.length||0, rows[SESSION_ROW]?.length||0, rows[COURSE_ROW]?.length||0);
     let lastValidCol = ncols - 1;
+    // Build a Set of hidden column indices from the worksheet's !cols property (SheetJS)
+    const hiddenCols = new Set();
+    if(ws['!cols']){ ws['!cols'].forEach((col, ci)=>{ if(col && col.hidden) hiddenCols.add(ci); }); }
+
     for(let c=dateStartCol;c<ncols;c++){
       // Use cellToISO — this correctly handles cells formatted as "7-Apr" (no year) by reading
       // the raw serial number from the worksheet instead of the formatted display string.
@@ -3835,6 +3839,9 @@ function parseWorkbook(wb){
       const coh = vstr((rows[COHORT_ROW]||[])[c]);
       // Use cellToTime — handles "8:00 AM" strings and raw fractional-day numbers.
       const timeParsed = cellToTime(ws, TIME_ROW, c, (rows[TIME_ROW]||[])[c]);
+      // Skip hidden columns — they participate in metadata forward-fill above but
+      // must not generate activities or assignments in the output.
+      if(hiddenCols.has(c)) continue;
       colsMeta[c] = { date: lastDate, course: lastCourse, session: lastSession,
                       cohort: coh, venue: lastVenue, time: timeParsed };
     }
