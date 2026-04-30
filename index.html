@@ -1235,7 +1235,6 @@ function instructorAssignments(main){
 function monthLabel(m){
   if(!m) return '';
   const d = new Date(m+'-01');
-  d.setMonth(d.getMonth() + 1); // display one month ahead (schedule months are shifted by -1)
   return d.toLocaleDateString(undefined,{month:'long',year:'numeric'});
 }
 
@@ -3090,20 +3089,49 @@ function renderSupervisingFacultyView(){
   header.appendChild(el('button',{class:'btn secondary small',style:{marginTop:'.6rem'},onclick:()=>go('#welcome')}, '← Back'));
   main.appendChild(header);
 
-  // Get all SG activities that have at least one instructor assigned
-  const assignedActivityIds = new Set(State.data.assignments.map(a=>a.activity_id));
-  const sgActivities = State.data.master_schedule.filter(a =>
-    /SG|SGP/i.test(a.activity_type||'') && assignedActivityIds.has(a.activity_id)
-  );
-  if(!sgActivities.length){
-    main.appendChild(el('div',{class:'note warn'},'No assigned Small Group activities found in the current roster.'));
-    return;
-  }
-
   // Strip cohort suffix like "(A)", "(B)", "(C)", "(D)" to get the base SG name
   function baseSgName(name){ return (name||'').replace(/\s*\([A-Z]\)\s*$/,'').trim(); }
 
-  // Deduplicate by BASE name (merges cohort variants into one entry)
+  // All SG activities (including hidden-column ones — all columns are parsed)
+  const allSgActivities = State.data.master_schedule.filter(a =>
+    /SG|SGP/i.test(a.activity_type||'')
+  );
+
+  // Build activityId→baseName map and count unique instructors per base SG name
+  const actIdToBase = {};
+  allSgActivities.forEach(a => {
+    actIdToBase[a.activity_id] = baseSgName(a.activity_name||a.activity_id);
+  });
+
+  // For each base SG name, collect unique instructor IDs assigned across all cohorts
+  const baseInstructors = {}; // baseName → Set of instructor_ids
+  for(const asgn of State.data.assignments){
+    const base = actIdToBase[asgn.activity_id];
+    if(!base) continue;
+    if(!baseInstructors[base]) baseInstructors[base] = new Set();
+    baseInstructors[base].add(asgn.instructor_id);
+  }
+
+  // Only keep base SG groups with ≥4 unique instructors assigned
+  const MIN_INSTRUCTORS = 4;
+  const qualifiedBases = new Set(
+    Object.entries(baseInstructors)
+      .filter(([, ids]) => ids.size >= MIN_INSTRUCTORS)
+      .map(([base]) => base)
+  );
+
+  // sgActivities = only activities belonging to a qualified base group
+  const sgActivities = allSgActivities.filter(a =>
+    qualifiedBases.has(actIdToBase[a.activity_id])
+  );
+
+  if(!sgActivities.length){
+    main.appendChild(el('div',{class:'note warn'},
+      'No Small Group activities with '+MIN_INSTRUCTORS+' or more instructors assigned were found.'));
+    return;
+  }
+
+  // Deduplicate by BASE name (merges cohort variants into one entry), qualified only
   const seenBase = new Set();
   const uniqueSG = [];
   sgActivities.forEach(a => {
