@@ -2359,71 +2359,99 @@ function adminImport(main){
       try{
         await ensureSheetJs();
         const buf=await file.arrayBuffer();
-        let rows;
+        const byName={};
+
+        function normalDate(v){
+          if(!v && v!==0) return '';
+          if(v instanceof Date) return v.toISOString().slice(0,10);
+          const s=String(v).trim();
+          if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
+          const m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+          if(m){const y=m[3].length===2?'20'+m[3]:m[3];return y+'-'+m[1].padStart(2,'0')+'-'+m[2].padStart(2,'0');}
+          return '';
+        }
+        function addEntry(name,startV,endV){
+          name=String(name||'').trim();
+          if(!name||/^\d+$/.test(name)) return;
+          if(/^not.*(yet|assigned)/i.test(name)||/name of clarifying/i.test(name)) return;
+          if(!/[a-zA-Z]{2}/.test(name)) return;
+          const s=normalDate(startV), e=normalDate(endV||startV);
+          if(!s) return;
+          const dates=dateRange(s,e||s).filter(d=>/^\d{4}-\d{2}-\d{2}$/.test(d));
+          if(!dates.length) return;
+          if(!byName[name]) byName[name]={name,dates:[]};
+          dates.forEach(d=>{if(!byName[name].dates.includes(d)) byName[name].dates.push(d);});
+        }
+
         if(file.name.toLowerCase().endsWith('.csv')){
           const text=new TextDecoder().decode(buf);
           const lines=text.split('\n').filter(l=>l.trim());
-          const headers=lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/"/g,''));
-          rows=lines.slice(1).map(l=>{const vals=l.split(',').map(v=>v.trim().replace(/"/g,''));const o={};headers.forEach((h,i)=>o[h]=vals[i]||'');return o;});
+          if(lines.length<2) throw new Error('No data rows in CSV.');
+          const hdrs=lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/"/g,''));
+          const nameC=hdrs.findIndex(h=>/name|instructor|faculty/.test(h));
+          const startC=hdrs.findIndex(h=>/start/.test(h));
+          const endC=hdrs.findIndex(h=>/\bend\b/.test(h));
+          const dateC=hdrs.findIndex(h=>/^date$|leave.?date|loa.?date/.test(h));
+          if(nameC<0) throw new Error('No instructor name column found. Headers: '+hdrs.join(', '));
+          lines.slice(1).forEach(l=>{
+            const v=l.split(',').map(x=>x.trim().replace(/"/g,''));
+            addEntry(v[nameC], v[startC>=0?startC:dateC], v[endC>=0?endC:'']);
+          });
         } else {
-          // cellDates:true → date cells become JS Date objects; raw:false + dateNF
-          // tells sheet_to_json to serialize them as 'yyyy-mm-dd' strings instead.
-          const wb=XLSX.read(buf,{cellDates:true});
-          rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:'',raw:false,dateNF:'yyyy-mm-dd'});
-        }
-        // Helper: extract a cell value; converts Date objects to ISO string as fallback.
-        function loaGet(r, pat){
-          const keys=Object.keys(r);
-          const k=keys.find(k=>pat.test(k.toLowerCase()));
-          if(!k) return '';
-          const v=r[k];
-          if(v instanceof Date) return v.toISOString().slice(0,10);
-          return String(v||'').trim();
-        }
-        // Helper: normalise a raw date value (ISO, JS Date, Excel serial, common formats).
-        function loaToISO(raw){
-          if(!raw) return '';
-          if(raw instanceof Date) return raw.toISOString().slice(0,10);
-          const s=String(raw).trim();
-          if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
-          // m/d/yyyy or d/m/yyyy
-          const md=s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})/);
-          if(md){
-            const y=md[3].length===2?'20'+md[3]:md[3];
-            return y+'-'+md[1].padStart(2,'0')+'-'+md[2].padStart(2,'0');
+          const wb=XLSX.read(buf,{cellDates:true,cellStyles:true});
+          const ws=wb.Sheets[wb.SheetNames[0]];
+          if(!ws['!ref']) throw new Error('Worksheet appears to be empty.');
+          const range=XLSX.utils.decode_range(ws['!ref']);
+          const EC=(r,c)=>XLSX.utils.encode_cell({r,c});
+          const cellVal=(r,c)=>{
+            const cell=ws[EC(r,c)];
+            if(!cell) return '';
+            if(cell.v instanceof Date) return cell.v.toISOString().slice(0,10);
+            return String(cell.v||'').trim();
+          };
+          const isStruck=(r,c)=>{
+            const cell=ws[EC(r,c)];
+            return !!(cell&&cell.s&&cell.s.font&&(cell.s.font.strike||cell.s.font.strikethrough));
+          };
+          const hdrs={};
+          for(let c=range.s.c;c<=range.e.c;c++) hdrs[c]=cellVal(range.s.r,c).toLowerCase();
+          const colFor=pat=>{
+            for(let c=range.s.c;c<=range.e.c;c++) if(pat.test(hdrs[c])) return c;
+            return -1;
+          };
+          const nameC =colFor(/name|instructor|faculty/);
+          const startC=colFor(/start/);
+          const endC  =colFor(/\bend\b/);
+          const dateC =colFor(/^date$|leave.?date|loa.?date/);
+          if(nameC<0) throw new Error(
+            'Cannot find instructor name column. Headers: '+
+            Object.values(hdrs).filter(Boolean).join(', '));
+          // Forward-fill name column to handle Excel merged cells (SheetJS only
+          // populates the top-left cell of a merged region; the rest are empty).
+          let lastName='';
+          for(let r=range.s.r+1;r<=range.e.r;r++){
+            if(isStruck(r,nameC)) continue;
+            if(startC>=0&&isStruck(r,startC)) continue;
+            const rawName=cellVal(r,nameC);
+            if(rawName) lastName=rawName;
+            const startV=startC>=0?cellVal(r,startC):dateC>=0?cellVal(r,dateC):'';
+            const endV  =endC>=0  ?cellVal(r,endC)  :'';
+            addEntry(lastName,startV,endV);
           }
-          return '';
         }
-        const byName={};
-        rows.forEach(r=>{
-          // Accept columns: Name, Instructor, Instructor Name, Faculty Name, etc.
-          const name=loaGet(r,/name|instructor|faculty/); if(!name) return;
-          // Skip header-like values
-          if(/name|instructor|faculty|header/i.test(name) && name.split(' ').length<=3 && !/[A-Z][a-z]+ [A-Z][a-z]+/.test(name)) return;
-          // Date columns: Date, Leave Date, LOA Date, Start Date / End Date
-          const singleRaw=loaGet(r,/^date$|loa.?date|leave.?date/);
-          const startRaw =loaGet(r,/start/);
-          const endRaw   =loaGet(r,/end/);
-          let dates=[];
-          if(singleRaw){
-            const iso=loaToISO(singleRaw);
-            if(iso) dates.push(iso);
-          } else if(startRaw){
-            const s=loaToISO(startRaw), e=loaToISO(endRaw||startRaw);
-            if(s && e) dates=dateRange(s,e);
-            else if(s) dates=[s];
-          }
-          dates=dates.filter(d=>/^\d{4}-\d{2}-\d{2}$/.test(d));
-          if(!dates.length) return;
-          if(!byName[name]) byName[name]={name,dates:[]};
-          dates.forEach(d=>{ if(!byName[name].dates.includes(d)) byName[name].dates.push(d); });
-        });
+
         State.loaData=Object.values(byName);
         await persist();
         const total=State.loaData.reduce((s,r)=>s+r.dates.length,0);
-        status.textContent='Loaded '+State.loaData.length+' instructor record(s), '+total+' leave date(s) from '+file.name+'.';
-        toast('LOA sheet imported','ok'); updateLoaSummary(); fileIn.value='';
-      }catch(err){status.textContent='Import failed: '+(err.message||err);toast('LOA import failed','err');}
+        status.textContent='Loaded '+State.loaData.length+' instructor record(s), '+total+
+          ' leave date(s) from '+file.name+'.';
+        toast('LOA sheet imported','ok');
+        updateLoaSummary();
+        fileIn.value='';
+      }catch(err){
+        status.textContent='Import failed: '+(err.message||err);
+        toast('LOA import failed','err');
+      }
     }
   })();
 
