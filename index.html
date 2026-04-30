@@ -3265,62 +3265,136 @@ function renderSupervisingFacultyView(){
     )));
     sgResult.appendChild(list);
 
-    // Find best meeting times: dates where majority of assigned instructors are free
+    // ── Suggested Review Time Slots ─────────────────────────────────────────────
     const months = getAppScheduleMonths();
     if(!months.length || !assignedIds.length) return;
 
-    // Build busy map: instructorId → Set of dates busy
-    const busyMap = {};
-    assignedIds.forEach(id=>{
-      const dates = new Set([
-        ...assignmentsForInstructor(id).map(a=>a.date).filter(Boolean),
-        ...reviewsForInstructor(id).map(r=>r.review_date).filter(Boolean),
-      ]);
-      busyMap[id] = dates;
-    });
+    // Activity-type duration table (minutes).
+    const ACT_DUR = { SG:120, SGP:120, ITI:180, SIM:240 };
+    const DEFAULT_ACT_DUR = 60;
+    // Usable daily blocks (minutes from midnight): 8–12 and 13–17, excluding lunch.
+    const DAY_BLOCKS = [{s:8*60,e:12*60},{s:13*60,e:17*60}];
+    const TOTAL_DAY_MIN = DAY_BLOCKS.reduce((t,b)=>t+(b.e-b.s),0); // 480 min = 8 h
 
-    // Check each working day in the schedule months
-    const freeSlots = [];
-    for(const ym of months){
-      const [y,m] = ym.split('-').map(Number);
-      const daysInMonth = new Date(y,m,0).getDate();
-      for(let day=1;day<=daysInMonth;day++){
-        const ds = y+'-'+String(m).padStart(2,'0')+'-'+String(day).padStart(2,'0');
-        const dow = new Date(ds+'T12:00:00').getDay();
-        if(dow===0||dow===6) continue; // skip weekends
-        const freeCount = assignedIds.filter(id=>!(busyMap[id]||new Set()).has(ds)).length;
-        const pct = Math.round(100*freeCount/assignedIds.length);
-        if(freeCount > assignedIds.length/2){ // majority free
-          freeSlots.push({date:ds, freeCount, total:assignedIds.length, pct});
+    function minToHHMM(m){ // e.g. 510 → "8:30 AM"
+      const h=Math.floor(m/60), mn=m%60;
+      const ap=h>=12?'PM':'AM', hr=h%12||12;
+      return hr+':'+(mn?String(mn).padStart(2,'0'):'00')+' '+ap;
+    }
+    function subtractInterval(blocks,s,e){
+      const out=[];
+      for(const b of blocks){
+        if(e<=b.s||s>=b.e){ out.push(b); continue; }
+        if(s>b.s) out.push({s:b.s,e:s});
+        if(e<b.e) out.push({s:e,e:b.e});
+      }
+      return out;
+    }
+    // Compute free time blocks for one instructor on one date.
+    function freeBlocksForInstructor(id,date){
+      let blocks=DAY_BLOCKS.map(b=>({s:b.s,e:b.e}));
+      const asgns=assignmentsForInstructor(id).filter(a=>a.date===date&&isActiveAssignment(a));
+      for(const a of asgns){
+        const act=activityById(a.activity_id)||{};
+        const atype=(act.activity_type||'').toUpperCase().trim();
+        let bs,be;
+        if(a.start_time&&a.end_time){
+          bs=timeToMin(a.start_time); be=timeToMin(a.end_time);
+        } else {
+          const dur=ACT_DUR[atype]||DEFAULT_ACT_DUR;
+          bs=blocks.length?blocks[0].s:8*60; be=bs+dur;
         }
+        if(bs!=null&&be!=null) blocks=subtractInterval(blocks,bs,be);
+      }
+      return blocks;
+    }
+    function totalFreeMin(blocks){ return blocks.reduce((t,b)=>t+(b.e-b.s),0); }
+
+    // For a day, find time windows where the MAJORITY of instructors are free.
+    // Scan in 15-min slots; group consecutive majority-free slots into windows ≥ 30 min.
+    function groupFreeWindows(instrBlocks){
+      const majority=Math.ceil(instrBlocks.length/2);
+      const slots=[];
+      for(const blk of DAY_BLOCKS){
+        for(let t=blk.s;t<blk.e;t+=15){
+          const freeN=instrBlocks.filter(bs=>bs.some(b=>b.s<=t&&b.e>=t+15)).length;
+          slots.push({t,free:freeN>=majority,freeN});
+        }
+      }
+      const windows=[]; let ws=null;
+      for(let i=0;i<slots.length;i++){
+        const {t,free}=slots[i];
+        if(free&&ws===null) ws=t;
+        if((!free||i===slots.length-1)&&ws!==null){
+          const we=free?t+15:t;
+          if(we-ws>=30) windows.push({s:ws,e:we,dur:we-ws});
+          ws=null;
+        }
+      }
+      return windows;
+    }
+
+    // Gather candidates: weekdays in schedule months where majority have free time.
+    const candidates=[];
+    for(const ym of months){
+      const [yr,mo]=ym.split('-').map(Number);
+      const dim=new Date(yr,mo,0).getDate();
+      for(let day=1;day<=dim;day++){
+        const ds=yr+'-'+String(mo).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+        if(new Date(ds+'T12:00:00').getDay()===0||new Date(ds+'T12:00:00').getDay()===6) continue;
+        const instrBlocks=assignedIds.map(id=>freeBlocksForInstructor(id,ds));
+        const freeCount=instrBlocks.filter(bs=>totalFreeMin(bs)>=60).length;
+        if(freeCount<=assignedIds.length/2) continue; // less than majority available
+        const windows=groupFreeWindows(instrBlocks);
+        if(!windows.length) continue;
+        const pct=Math.round(100*freeCount/assignedIds.length);
+        const maxFree=Math.max(...instrBlocks.map(bs=>totalFreeMin(bs)));
+        candidates.push({date:ds,freeCount,total:assignedIds.length,pct,windows,maxFree});
       }
     }
 
-    sgResult.appendChild(el('h3',null,'Suggested Meeting Times'));
-    if(!freeSlots.length){
-      sgResult.appendChild(el('div',{class:'note warn'},'No date found where the majority of instructors are free simultaneously.'));
+    sgResult.appendChild(el('h3',null,'Suggested Review Times'));
+    if(!candidates.length){
+      sgResult.appendChild(el('div',{class:'note warn'},
+        'No date found where the majority of instructors have available review time.'));
       return;
     }
-    // Sort by most free, then by date
-    freeSlots.sort((a,b)=>b.pct-a.pct||a.date.localeCompare(b.date));
-    const top = freeSlots.slice(0,10);
-    const best = top[0];
-    const ftbl = el('table',{class:'tbl'});
-    ftbl.appendChild(el('tr',{},...['Date','Free','Busy','% Free'].map(h=>el('th',{},h))));
+    // Sort: most free instructors first, then longest free window, then earliest date.
+    candidates.sort((a,b)=>b.pct-a.pct||b.maxFree-a.maxFree||a.date.localeCompare(b.date));
+    const top=candidates.slice(0,10);
+    const best=top[0];
+
+    // Build results table with time-window detail.
+    const ftbl=el('table',{class:'tbl',style:{fontSize:'.82rem'}});
+    ftbl.appendChild(el('tr',{},
+      ...['Date','Free / Total','Available Windows','Free Hours'].map(h=>el('th',{},h))
+    ));
     top.forEach((s,i)=>{
-      const isTop = i===0;
-      const tr = el('tr',{style:isTop?{background:'var(--green-soft)'}:{}},
-        el('td',{},fmtDateLong(s.date)+(isTop?' ⭐ Best':'') ),
-        el('td',{},String(s.freeCount)),
-        el('td',{},String(s.total-s.freeCount)),
-        el('td',{},el('span',{class:'badge '+(s.pct>=80?'green':s.pct>=60?'yellow':'gray')},s.pct+'%'))
-      );
-      ftbl.appendChild(tr);
+      const isTop=i===0;
+      const windowsText=s.windows.map(w=>minToHHMM(w.s)+' – '+minToHHMM(w.e)).join('  |  ');
+      const freeHrs=(s.maxFree/60).toFixed(1)+'h';
+      ftbl.appendChild(el('tr',{style:isTop?{background:'var(--green-soft)'}:{}},
+        el('td',{},fmtDateLong(s.date)+(isTop?' ⭐':'') ),
+        el('td',{},el('span',{class:'badge '+(s.pct>=80?'green':s.pct>=60?'yellow':'gray')},
+          s.freeCount+' / '+s.total)),
+        el('td',{style:{whiteSpace:'nowrap'}}, windowsText||'—'),
+        el('td',{}, freeHrs)
+      ));
     });
     sgResult.appendChild(el('div',{class:'tbl-wrap'},ftbl));
+
+    // Best-option callout with full window detail.
+    const bestWindows=best.windows.map(w=>minToHHMM(w.s)+' – '+minToHHMM(w.e)).join(', ');
     sgResult.appendChild(el('div',{class:'note',style:{marginTop:'.6rem'}},
       el('strong',null,'Best option: '),
-      fmtDateLong(best.date)+' — '+best.freeCount+' of '+best.total+' instructors are free ('+best.pct+'%).'
+      fmtDateLong(best.date)+' — ',
+      el('span',null,best.freeCount+' of '+best.total+' instructors free ('+best.pct+'%).'),
+      el('br'),
+      el('strong',null,'Available windows: '),
+      el('span',null,bestWindows),
+      el('br'),
+      el('span',{class:'muted',style:{fontSize:'.88rem'}},
+        'Lunch (12:00 PM – 1:00 PM) excluded. Activity durations: SG/SGP = 2 h, ITI = 3 h, SIM = 4 h.')
     ));
   });
 }
