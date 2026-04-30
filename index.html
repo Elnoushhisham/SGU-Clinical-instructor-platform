@@ -309,7 +309,7 @@ const DEPT_PASSCODES = {
   "Pathophysiology": "physio123",
 };
 const SUPERVISING_PASSCODE = "super123"; // Supervising Faculty passcode
-const STORE_KEY = "clinical_roster_v1";
+const STORE_KEY = "clinical_roster_v2";
 
 const State = {
   data: null,        // { instructors, master_schedule, review_sessions, assignments, review_attendance, ... }
@@ -572,13 +572,11 @@ async function bootstrap(){
       State.data = d;
       // Always sync schedule_months and sheets_seen from the embedded seed so
       // the calendar reflects the current file even when using cached data.
+      // sheets_seen is kept in sync from the seed to guard against
+      // template-leftover month contamination in old cached data.
       const seed = getSeed();
-      if(seed && seed.meta){
-        if(seed.meta.schedule_months && seed.meta.schedule_months.length)
-          State.data.meta.schedule_months = seed.meta.schedule_months;
-        if(seed.meta.sheets_seen && seed.meta.sheets_seen.length)
-          State.data.meta.sheets_seen = seed.meta.sheets_seen;
-      }
+      if(seed && seed.meta && seed.meta.sheets_seen && seed.meta.sheets_seen.length)
+        State.data.meta.sheets_seen = seed.meta.sheets_seen;
     }
     State.settings = Object.assign(State.settings, persisted.settings || {});
     State.me = persisted.me || null;
@@ -2929,16 +2927,20 @@ function renderDeptChairView(dept){
     el('strong',null,'Absent w/o Notification'), ': absent with no prior notification.'));
   const tbl = el('table',{class:'tbl'});
   tbl.appendChild(el('tr',{},
-    ...['Instructor','Absent w/ Notification','Absent w/o Notification','Late','Total'].map(h=>el('th',{},h))
+    ...['Instructor','Absent w/ Notification','Absent w/o Notification','Late','Irregularities','Commendations','Total'].map(h=>el('th',{},h))
   ));
   report.forEach(r => {
     const sev = r.total_days >= 5 ? 'red' : r.total_days >= 3 ? 'yellow' : r.total_days ? 'gray' : 'green';
-    const lateN = lateCountForInstructor(r.instructor_id);
+    const lateN   = lateCountForInstructor(r.instructor_id);
+    const irregN  = irregularitiesForInstructor(r.full_name).length;
+    const commendN = commendationsForInstructor(r.full_name).length;
     tbl.appendChild(el('tr',{style:{cursor:'pointer'},onclick:()=>showDeptInstructorDetail(r,dept)},
       el('td',{},r.full_name),
       el('td',{},el('span',{class:'badge blue'},String(r.excused_days))),
       el('td',{},el('span',{class:'badge '+(r.unexcused_days?'red':'gray')},String(r.unexcused_days))),
       el('td',{},el('span',{class:'badge '+(lateN?'yellow':'gray')},String(lateN))),
+      el('td',{},el('span',{class:'badge '+(irregN?'red':'gray')},String(irregN))),
+      el('td',{},el('span',{class:'badge '+(commendN?'green':'gray')},String(commendN))),
       el('td',{},el('span',{class:'badge '+sev},String(r.total_days)))
     ));
   });
