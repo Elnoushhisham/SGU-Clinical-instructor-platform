@@ -605,8 +605,11 @@ async function bootstrap(){
       .then(()=>{ toast('Data refreshed from published source','ok'); setSubtitle(); routeFromHash(); })
       .catch(e=>{ console.warn('Auto-fetch failed:',e); });
   }
+  // Always land on the welcome screen on every fresh page load,
+  // regardless of what hash the URL contains from a previous session.
+  history.replaceState(null, '', location.pathname + location.search + '#welcome');
   setSubtitle();
-  routeFromHash();
+  renderWelcome();
   window.addEventListener('hashchange', routeFromHash);
 }
 
