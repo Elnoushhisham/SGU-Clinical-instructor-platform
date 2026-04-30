@@ -774,9 +774,32 @@ function assignmentsForInstructor(instructorId){
   return State.data.assignments.filter(a => a.instructor_id === instructorId);
 }
 function reviewsForInstructor(instructorId){
-  return State.data.review_attendance
+  // Method A: via review_attendance table (auto-derived during parsing)
+  const seenIds = new Set();
+  const results = [];
+  State.data.review_attendance
     .filter(a => a.instructor_id === instructorId)
-    .map(a => Object.assign({}, reviewById(a.review_id) || {}, { _attendance: a }));
+    .forEach(a => {
+      const rev = reviewById(a.review_id);
+      if(rev && !seenIds.has(rev.review_id)){
+        seenIds.add(rev.review_id);
+        results.push(Object.assign({}, rev, { _attendance: a }));
+      }
+    });
+  // Method B: direct activity→review link — catches cases where the string-match
+  // linking succeeded but review_attendance wasn't populated (e.g. re-imports).
+  const myActivityIds = new Set(
+    (State.data.assignments||[])
+      .filter(a => a.instructor_id === instructorId && a.is_active !== false)
+      .map(a => a.activity_id)
+  );
+  (State.data.review_sessions||[]).forEach(rev => {
+    if(rev.linked_activity_id && myActivityIds.has(rev.linked_activity_id) && !seenIds.has(rev.review_id)){
+      seenIds.add(rev.review_id);
+      results.push(Object.assign({}, rev, { _attendance: null }));
+    }
+  });
+  return results;
 }
 
 /* -------- 4. ROUTING ----------------------------------- */
@@ -1232,7 +1255,10 @@ function instructorAssignments(main){
 }
 function monthLabel(m){
   if(!m) return '';
-  const d = new Date(m+'-01');
+  // Parse as local date (not UTC) to avoid timezone rollback:
+  // new Date('2026-04-01') is UTC midnight which in UTC-4 displays as March 31.
+  const [y, mo] = m.split('-').map(Number);
+  const d = new Date(y, mo - 1, 1);   // local midnight — correct month guaranteed
   return d.toLocaleDateString(undefined,{month:'long',year:'numeric'});
 }
 
@@ -3787,7 +3813,12 @@ function parseWorkbook(wb){
     if(name.includes('@') && !email.includes('@') && email.length > 1){
       const tmp = name; name = email.replace(/\s+/g,' '); email = tmp;
     }
-    if(!name || name === 'Not Yet added/Resigned' || name === '#REF!' || name.includes('@')) return null;
+    // Skip non-name values: empty, placeholder strings, pure numbers
+    if(!name) return null;
+    if(/^not (yet )?assigned/i.test(name)) return null;       // "Not assigned yet", "Not Yet added/Resigned" etc.
+    if(/^\d+$/.test(name)) return null;                        // pure numeric cell (row counts, IDs)
+    if(name === '#REF!' || name.includes('@')) return null;
+    if(!/[a-zA-Z]{2}/.test(name)) return null;                // must contain at least 2 letters
     email = email.toLowerCase();
     const bare = name.replace(/^(Dr\.?|Mr\.?|Mrs\.?|Ms\.?|Prof(?:essor)?\.?)\s+/i,'').toLowerCase();
     const key = (email || bare).replace(/\s+/g,'');
@@ -3973,7 +4004,15 @@ function parseWorkbook(wb){
       if(dParsed && /^\d{4}-\d{2}-\d{2}/.test(dParsed)){
         const ds = dParsed.slice(0,10);
         if(firstDate === null) firstDate = ds;
-        else if(ds < firstDate){ lastValidCol = c - 1; break; }  // template leftover — stop
+        else if(ds < firstDate){
+          // Only stop if the regression is large (> 60 days) — a genuine prior-term
+          // template leftover.  Small regressions (e.g. a repeat/recap column) are
+          // skipped without terminating the scan so late-May dates are not cut off.
+          const gap = (new Date(firstDate) - new Date(ds)) / 86400000;
+          if(gap > 60){ lastValidCol = c - 1; break; }
+          // Else: skip this column's date assignment but keep scanning
+          continue;
+        }
         lastDate = ds;
       }
       const co = vstr((rows[COURSE_ROW]||[])[c]); if(co) lastCourse = co;
