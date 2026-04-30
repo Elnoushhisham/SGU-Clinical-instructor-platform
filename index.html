@@ -2366,20 +2366,53 @@ function adminImport(main){
           const headers=lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/"/g,''));
           rows=lines.slice(1).map(l=>{const vals=l.split(',').map(v=>v.trim().replace(/"/g,''));const o={};headers.forEach((h,i)=>o[h]=vals[i]||'');return o;});
         } else {
+          // cellDates:true → date cells become JS Date objects; raw:false + dateNF
+          // tells sheet_to_json to serialize them as 'yyyy-mm-dd' strings instead.
           const wb=XLSX.read(buf,{cellDates:true});
-          rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+          rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:'',raw:false,dateNF:'yyyy-mm-dd'});
+        }
+        // Helper: extract a cell value; converts Date objects to ISO string as fallback.
+        function loaGet(r, pat){
+          const keys=Object.keys(r);
+          const k=keys.find(k=>pat.test(k.toLowerCase()));
+          if(!k) return '';
+          const v=r[k];
+          if(v instanceof Date) return v.toISOString().slice(0,10);
+          return String(v||'').trim();
+        }
+        // Helper: normalise a raw date value (ISO, JS Date, Excel serial, common formats).
+        function loaToISO(raw){
+          if(!raw) return '';
+          if(raw instanceof Date) return raw.toISOString().slice(0,10);
+          const s=String(raw).trim();
+          if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
+          // m/d/yyyy or d/m/yyyy
+          const md=s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})/);
+          if(md){
+            const y=md[3].length===2?'20'+md[3]:md[3];
+            return y+'-'+md[1].padStart(2,'0')+'-'+md[2].padStart(2,'0');
+          }
+          return '';
         }
         const byName={};
         rows.forEach(r=>{
-          const keys=Object.keys(r);
-          const get=pat=>{const k=keys.find(k=>pat.test(k.toLowerCase()));return k?String(r[k]||'').trim():'';};
-          const name=get(/name|instructor/); if(!name) return;
-          const single=get(/^date$|leave.?date/);
-          const start=get(/start/); const end=get(/end/);
+          // Accept columns: Name, Instructor, Instructor Name, Faculty Name, etc.
+          const name=loaGet(r,/name|instructor|faculty/); if(!name) return;
+          // Skip header-like values
+          if(/name|instructor|faculty|header/i.test(name) && name.split(' ').length<=3 && !/[A-Z][a-z]+ [A-Z][a-z]+/.test(name)) return;
+          // Date columns: Date, Leave Date, LOA Date, Start Date / End Date
+          const singleRaw=loaGet(r,/^date$|loa.?date|leave.?date/);
+          const startRaw =loaGet(r,/start/);
+          const endRaw   =loaGet(r,/end/);
           let dates=[];
-          if(single) dates.push(single.slice(0,10));
-          else if(start&&end) dates=dateRange(start.slice(0,10),end.slice(0,10));
-          else if(start) dates.push(start.slice(0,10));
+          if(singleRaw){
+            const iso=loaToISO(singleRaw);
+            if(iso) dates.push(iso);
+          } else if(startRaw){
+            const s=loaToISO(startRaw), e=loaToISO(endRaw||startRaw);
+            if(s && e) dates=dateRange(s,e);
+            else if(s) dates=[s];
+          }
           dates=dates.filter(d=>/^\d{4}-\d{2}-\d{2}$/.test(d));
           if(!dates.length) return;
           if(!byName[name]) byName[name]={name,dates:[]};
@@ -2387,7 +2420,8 @@ function adminImport(main){
         });
         State.loaData=Object.values(byName);
         await persist();
-        status.textContent='Loaded '+State.loaData.length+' instructor records from '+file.name+'.';
+        const total=State.loaData.reduce((s,r)=>s+r.dates.length,0);
+        status.textContent='Loaded '+State.loaData.length+' instructor record(s), '+total+' leave date(s) from '+file.name+'.';
         toast('LOA sheet imported','ok'); updateLoaSummary(); fileIn.value='';
       }catch(err){status.textContent='Import failed: '+(err.message||err);toast('LOA import failed','err');}
     }
@@ -3816,6 +3850,7 @@ function parseWorkbook(wb){
     // Skip non-name values: empty, placeholder strings, pure numbers
     if(!name) return null;
     if(/^not (yet )?assigned/i.test(name)) return null;       // "Not assigned yet", "Not Yet added/Resigned" etc.
+    if(/name of clarifying faculty/i.test(name)) return null;  // placeholder header cell
     if(/^\d+$/.test(name)) return null;                        // pure numeric cell (row counts, IDs)
     if(name === '#REF!' || name.includes('@')) return null;
     if(!/[a-zA-Z]{2}/.test(name)) return null;                // must contain at least 2 letters
