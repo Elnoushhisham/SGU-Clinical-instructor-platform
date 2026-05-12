@@ -507,8 +507,11 @@ function hasOverlappingLeave(instructorId, startISO, endISO, excludeRequestId){
 /* -------- Periodic-publish JSON fetch ----------------------- */
 async function fetchFromDataUrl(url){
   if(!url) throw new Error('No data URL configured');
+  // Cache-bust the URL: combine cache:'no-store' with a per-request timestamp param
+  // so neither the browser nor the GitHub Pages / CDN edge serves a stale copy.
+  const bustUrl = url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
   let resp;
-  try{ resp = await fetch(url, {cache:'no-cache'}); }
+  try{ resp = await fetch(bustUrl, {cache:'no-store', headers:{'Cache-Control':'no-cache'}}); }
   catch(e){ throw new Error('Network error: ' + (e.message||e)); }
   if(!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + resp.statusText);
   let newData;
@@ -597,11 +600,24 @@ async function bootstrap(){
   }
   ensureLeaveTable();
   sanitizeDataset();
-  // Auto-fetch published JSON on open when URL is configured
+  // Has the user imported their own dataset on this device?  We use this to avoid
+  // overwriting freshly-imported local data with an older bundled roster-data.json.
+  const hasUserData = !!(persisted && persisted.data &&
+    persisted.data.meta && persisted.data.meta.source_file);
+  // Auto-fetch published JSON on open when URL is configured.
+  // Fallback: if no remote dataUrl is set and there is no user-imported local data,
+  // try a same-folder roster-data.json so a GitHub Pages deployment can ship its live
+  // roster as a separate file (embedded <script id="seed-data"> is only a last resort).
   if(State.settings.dataUrl && State.settings.dataUrlAutoFetch !== false){
     fetchFromDataUrl(State.settings.dataUrl)
       .then(()=>{ toast('Data refreshed from published source','ok'); setSubtitle(); routeFromHash(); })
       .catch(e=>{ console.warn('Auto-fetch failed:',e); });
+  } else if(!hasUserData && location.protocol !== 'file:'){
+    // Quietly try a local roster-data.json next to index.html — skip when running off file://
+    // because browsers block fetch() for local files (and the embedded seed is fine there).
+    fetchFromDataUrl('roster-data.json')
+      .then(()=>{ console.info('bootstrap: loaded roster-data.json'); setSubtitle(); routeFromHash(); })
+      .catch(e=>{ console.info('bootstrap: no roster-data.json — using cached/seed data:', e.message||e); });
   }
   // Always land on the welcome screen on every fresh page load,
   // regardless of what hash the URL contains from a previous session.
@@ -2763,6 +2779,65 @@ function adminImport(main){
   })();
 
 
+  /* ─── 0. Sync status banner + clear-local-data admin ─────────── */
+  const syncCard = el('div',{class:'card'});
+  syncCard.appendChild(el('h2',null,'Data status'));
+  const syncLine = el('div',{class:'muted',style:{marginBottom:'.5rem'}});
+  (function renderSyncLine(){
+    clear(syncLine);
+    const ts = State.settings.lastSyncedAt;
+    const srcFile = State.data && State.data.meta && State.data.meta.source_file;
+    if(ts){
+      syncLine.appendChild(el('span',{class:'badge green'},'Last imported / synced'));
+      syncLine.appendChild(el('span',null,' '+new Date(ts).toLocaleString()+' ('+fmtRelativeTime(ts)+')'));
+    } else {
+      syncLine.appendChild(el('span',{class:'badge gray'},'Never synced'));
+      syncLine.appendChild(el('span',null,' — using embedded seed data.'));
+    }
+    if(srcFile){
+      syncLine.appendChild(el('div',{class:'muted',style:{fontSize:'.82rem',marginTop:'.2rem'}},
+        'Source: '+srcFile));
+    }
+    if(State.settings.lastSyncError){
+      syncLine.appendChild(el('div',{class:'note err',style:{marginTop:'.3rem'}},
+        'Last fetch error: '+State.settings.lastSyncError));
+    }
+  })();
+  syncCard.appendChild(syncLine);
+  const syncBtns = el('div',{class:'cluster'});
+  syncBtns.appendChild(el('button',{class:'btn',onclick:async()=>{
+    if(!State.settings.dataUrl){ toast('No data URL configured — paste one below first','warn'); return; }
+    try{
+      const d = await fetchFromDataUrl(State.settings.dataUrl);
+      toast('Refreshed: '+d.instructors.length+' instructors','ok');
+      setTimeout(()=>location.reload(), 600);
+    }catch(err){
+      State.settings.lastSyncError = String(err.message||err);
+      await persist();
+      toast('Refresh failed: '+(err.message||err),'err');
+    }
+  }},'↻ Refresh from published URL'));
+  syncBtns.appendChild(el('button',{class:'btn danger',onclick:async()=>{
+    if(!confirm('Clear ALL local saved data on this device and reload the latest available data?\n\n' +
+                'This wipes the locally cached roster, settings overrides, and the leave requests stored on this device. ' +
+                'After reload the app will fetch the published JSON (if a URL is saved), or fall back to the embedded seed.')) return;
+    try{ await Storage.clear(); }catch(e){}
+    try{ if(window.indexedDB && indexedDB.databases){
+      const dbs = await indexedDB.databases();
+      for(const db of dbs){ if(db && db.name) try{ indexedDB.deleteDatabase(db.name); }catch(e){} }
+    }}catch(e){}
+    try{ if('caches' in window){
+      const keys = await caches.keys();
+      for(const k of keys) try{ await caches.delete(k); }catch(e){}
+    }}catch(e){}
+    // Force a hard reload that bypasses HTTP cache so the next bootstrap fetches fresh JSON.
+    const u = new URL(location.href);
+    u.searchParams.set('_cb', String(Date.now()));
+    location.replace(u.toString());
+  }},'🗑 Clear local saved data and reload latest'));
+  syncCard.appendChild(syncBtns);
+  masterPanel.appendChild(syncCard);
+
   /* ─── 1. Fetch from published JSON URL ─────────────────────── */
   const urlCard = el('div',{class:'card'});
   urlCard.appendChild(el('h2',null,'Fetch published roster JSON'));
@@ -2826,37 +2901,58 @@ function adminImport(main){
   urlCard.appendChild(urlBtns);
   masterPanel.appendChild(urlCard);
 
-  /* ─── 2. Upload Excel workbook manually ─────────────────────── */
+  /* ─── 2. Upload Excel workbook(s) manually ───────────────────── */
   const xlsCard = el('div',{class:'card'});
-  xlsCard.appendChild(el('h2',null,'Upload Excel workbook'));
+  xlsCard.appendChild(el('h2',null,'Upload Excel workbook(s)'));
   xlsCard.appendChild(el('div',{class:'note'},
-    'Upload the .xlsx directly for a one-off update. The app parses it in the browser — nothing is sent to a server.'));
-  const fileInput = el('input',{type:'file',accept:'.xlsx,.xls'});
+    'Upload one or more .xlsx workbooks at the same time. Each is parsed in the browser and merged into a single dataset — nothing is sent to a server. Leave requests on this device are preserved.'));
+  const fileInput = el('input',{type:'file',accept:'.xlsx,.xls',multiple:true});
   const uploadStatus = el('div',{class:'muted',style:{marginTop:'.5rem',fontSize:'.88rem'}});
   xlsCard.appendChild(fileInput);
   xlsCard.appendChild(uploadStatus);
   const xlsPreview = el('div',{style:{marginTop:'.8rem'}});
   xlsCard.appendChild(xlsPreview);
   fileInput.addEventListener('change', async (e)=>{
-    const file = e.target.files && e.target.files[0]; if(!file) return;
+    const files = Array.from((e.target && e.target.files) || []);
+    if(!files.length) return;
     uploadStatus.textContent = 'Loading Excel parser…';
     try{
       await ensureSheetJs();
-      uploadStatus.textContent = 'Parsing '+file.name+'…';
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, {cellDates:true});
-      const parsed = parseWorkbook(wb);
+      let merged = null;
+      const fileNames = [];
+      for(const file of files){
+        uploadStatus.textContent = 'Parsing '+file.name+'… ('+(fileNames.length+1)+'/'+files.length+')';
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, {cellDates:true});
+        const parsed = parseWorkbook(wb);
+        fileNames.push(file.name);
+        merged = merged ? mergeDatasets(merged, parsed) : parsed;
+      }
+      // Preserve any existing user-entered data (leave requests).
       const existingLeave = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
-      parsed.leave_requests = existingLeave;
-      parsed.meta = Object.assign({}, parsed.meta||{}, {source_file:file.name, parsed_at:new Date().toISOString()});
-      State.data = parsed;
+      merged.leave_requests = existingLeave;
+      merged.meta = Object.assign({}, merged.meta||{}, {
+        source_file: fileNames.join(', '),
+        source_files: fileNames,
+        parsed_at: new Date().toISOString(),
+        parser_version: 3,
+      });
+      // Rebuild schedule_months from the merged sheets_seen so allowed-month filtering covers every workbook.
+      const derivedMonths = _sheetMonthsFromMeta(merged.meta, merged.assignments);
+      if(derivedMonths.length) merged.meta.schedule_months = derivedMonths;
+      State.data = merged;
       sanitizeDataset(); ensureLeaveTable();
       State.overrides = {};
       State.settings.lastSyncedAt = new Date().toISOString();
       State.settings.lastSyncError = '';
       await persist();
-      uploadStatus.textContent = 'Imported '+State.data.instructors.length+' instructors, '+State.data.master_schedule.length+' activities, '+State.data.assignments.length+' assignments, '+State.data.review_sessions.length+' review sessions from '+file.name+'.';
-      toast('Workbook imported — refreshing','ok');
+      const summary = 'Imported '+files.length+' file'+(files.length!==1?'s':'')+' ('+fileNames.join(', ')+'): '+
+        State.data.instructors.length+' instructors · '+
+        State.data.master_schedule.length+' activities · '+
+        State.data.assignments.length+' assignments · '+
+        State.data.review_sessions.length+' review sessions.';
+      uploadStatus.textContent = summary;
+      toast('Imported '+files.length+' workbook'+(files.length!==1?'s':'')+' — refreshing','ok');
       clear(xlsPreview);
       xlsPreview.appendChild(el('div',{class:'kpi-grid'},
         kpi(State.data.instructors.length,'Instructors'),
@@ -2865,7 +2961,7 @@ function adminImport(main){
         kpi(State.data.review_sessions.length,'Reviews')
       ));
       fileInput.value = '';
-      setTimeout(()=>location.reload(), 700);
+      setTimeout(()=>location.reload(), 900);
     }catch(err){ uploadStatus.textContent='Import failed: '+(err.message||err); toast('Import failed','err'); }
   });
   masterPanel.appendChild(xlsCard);
@@ -4254,22 +4350,37 @@ function parseWorkbook(wb){
 }
 function mergeDatasets(a, b){
   // simple merge by id; b overrides a on collisions
-  const map = arr => Object.fromEntries(arr.map(x => [x[Object.keys(x)[0]], x]));
   function mergeBy(keyName, A, B){
     const m = {};
     for(const x of A) m[x[keyName]] = x;
     for(const x of B) m[x[keyName]] = Object.assign({}, m[x[keyName]]||{}, x);
     return Object.values(m);
   }
+  // Union meta arrays (sheets_seen, schedule_months) — without this, merging
+  // two workbooks would lose months/sheet names from the first file.
+  const aMeta = a.meta || {}, bMeta = b.meta || {};
+  const unionArr = (k) => [...new Set([...(aMeta[k]||[]), ...(bMeta[k]||[])])];
+  // Dedup review_attendance by (review_id, instructor_id) so re-merges don't double up.
+  const seenRa = new Set();
+  const review_attendance = (a.review_attendance||[]).concat(b.review_attendance||[]).filter(r => {
+    const k = (r.review_id||'')+'|'+(r.instructor_id||'');
+    if(seenRa.has(k)) return false;
+    seenRa.add(k); return true;
+  });
   return {
     instructors: mergeBy('instructor_id', a.instructors||[], b.instructors||[]),
     master_schedule: mergeBy('activity_id', a.master_schedule||[], b.master_schedule||[]),
     review_sessions: mergeBy('review_id', a.review_sessions||[], b.review_sessions||[]),
     assignments: mergeBy('assignment_id', a.assignments||[], b.assignments||[]),
-    review_attendance: (a.review_attendance||[]).concat(b.review_attendance||[]),
+    review_attendance,
     locations: [...new Set([...(a.locations||[]), ...(b.locations||[])])].sort(),
     courses: [...new Set([...(a.courses||[]), ...(b.courses||[])])].sort(),
-    meta: Object.assign({}, a.meta, b.meta),
+    leave_requests: (a.leave_requests || b.leave_requests || []).slice(),
+    meta: Object.assign({}, aMeta, bMeta, {
+      sheets_seen: unionArr('sheets_seen'),
+      schedule_months: unionArr('schedule_months').sort(),
+      parser_version: Math.max(aMeta.parser_version||0, bMeta.parser_version||0) || 3,
+    }),
   };
 }
 
