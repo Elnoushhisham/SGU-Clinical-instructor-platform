@@ -322,6 +322,7 @@ const State = {
     theme: 'auto',
     dataUrl: '',          // published JSON URL (GitHub Pages / Box / any CORS-OK host)
     dataUrlAutoFetch: true, // re-fetch on every app open when a URL is saved
+    hidePastDates: true,  // collapse past dates in the calendar (display-only; data is untouched)
     lastSyncedAt: null,
     lastSyncError: '',
     coordinatorEmail: 'clinicaltutorsyear2@sgu.edu',
@@ -1211,6 +1212,22 @@ function assignmentItem(a){
   item.appendChild(dl);
   return item;
 }
+// Canonical "is this an SG / Small-Group activity?" predicate.  Used across the
+// Supervising Faculty tab, the SG-without-review audit, and the linked-SG lookup.
+// Checks activity_type, activity_name, AND worksheet_source so a workbook that
+// uses any of these labels — SG, SGP, Small Group(s), B-Line, Table Group,
+// Group #N, Group Number — still gets picked up regardless of capitalisation
+// or whitespace.  Also catches activities parsed from a sheet whose own name
+// signals SG content (e.g. "B-Line sessions", "Group Numbers").
+const _SG_NAME_RE = /\bsgp?\b|\bsg\d+|small\s*-?\s*groups?|small\s*group\s*session|b\s*-?\s*line|table\s*group|\bgroup\s*(?:#|no\.?|number)?\s*\d+/i;
+const _SG_SRC_RE  = /b\s*-?\s*line|group\s*number|small\s*-?\s*group/i;
+function isSGActivity(act){
+  if(!act) return false;
+  if(_SG_NAME_RE.test(String(act.activity_type||''))) return true;
+  if(_SG_NAME_RE.test(String(act.activity_name||''))) return true;
+  if(_SG_SRC_RE.test(String(act.worksheet_source||''))) return true;
+  return false;
+}
 function reviewItem(r){
   const required = r._attendance && r._attendance.attendance_required;
   const item = el('div',{class:'item '+(required?'status-warn':'status-ok')});
@@ -1355,7 +1372,25 @@ function instructorCalendar(main){
   main.appendChild(card);
 }
 function buildMonthCalendar(month, opts){
+  opts = opts || {};
   const wrap = el('div',{style:{marginTop:'.6rem'}});
+  const todayISO = new Date().toISOString().slice(0,10);
+  const hidePast = State.settings.hidePastDates !== false; // default true
+
+  // ── Toggle: Hide past dates ────────────────────────────────────
+  const toggleRow = el('div',{class:'row',style:{justifyContent:'flex-end',alignItems:'center',gap:'.4rem',marginBottom:'.4rem',fontSize:'.85rem',flexWrap:'wrap'}});
+  const chk = el('input',{type:'checkbox'}); chk.checked = hidePast;
+  chk.onchange = async () => {
+    State.settings.hidePastDates = chk.checked;
+    try{ await persist(); }catch(e){}
+    // Re-render in place: rebuild this calendar with the same opts.
+    const replacement = buildMonthCalendar(month, opts);
+    wrap.replaceWith(replacement);
+  };
+  toggleRow.appendChild(el('label',{style:{display:'flex',alignItems:'center',gap:'.3rem',cursor:'pointer'}},
+    chk, el('span',null,'Hide past dates')));
+  wrap.appendChild(toggleRow);
+
   const head = el('div',{class:'cal'});
   ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(d => head.appendChild(el('div',{class:'head'},d)));
   wrap.appendChild(head);
@@ -1363,22 +1398,57 @@ function buildMonthCalendar(month, opts){
   const [y,m] = month.split('-').map(Number);
   const first = new Date(y, m-1, 1);
   const start = new Date(first); start.setDate(1 - first.getDay());
+  let hiddenEventCount = 0;
   for(let i=0;i<42;i++){
     const d = new Date(start); d.setDate(start.getDate()+i);
     const ds = d.toISOString().slice(0,10);
     const inMonth = d.getMonth() === m-1;
-    const day = el('div',{class:'day'+(inMonth?'':' dim')});
+    const isPast = ds < todayISO;
+    const isToday = ds === todayISO;
+    const collapsed = hidePast && isPast && inMonth;
+    const dayClasses = 'day'
+      + (inMonth ? '' : ' dim')
+      + (collapsed ? ' dim' : '')
+      + (isToday ? '' : '');
+    const day = el('div',{class: dayClasses, style: isToday ? {outline:'2px solid var(--primary)'} : null});
     day.appendChild(el('div',{class:'dn'}, inMonth ? String(d.getDate()) : ''));
     if(inMonth){
       const evts = (opts.assignments||[]).filter(a => a.date === ds);
       const revs = (opts.reviews||[]).filter(r => r.review_date === ds);
-      evts.forEach(a => day.appendChild(el('div',{class:'ev'+(opts.conflicts?.includes(ds)?' conflict':''),title:(activityById(a.activity_id)||{}).activity_name||''},
-        fmtTime(a.start_time)+' '+(((activityById(a.activity_id)||{}).activity_name||'').slice(0,18)))));
-      revs.forEach(r => day.appendChild(el('div',{class:'ev review',title:r.activity_name||''}, fmtTime(r.review_start_time)+' Review')));
+      const total = evts.length + revs.length;
+      if(collapsed && total){
+        hiddenEventCount += total;
+        day.appendChild(el('div',{
+          class:'ev',
+          style:{opacity:'.7',cursor:'pointer'},
+          title:'Click to view this day’s events',
+          onclick:()=>showDayEventsModal(ds, evts, revs),
+        }, total + ' past event' + (total===1?'':'s') + ' — view'));
+      } else {
+        evts.forEach(a => {
+          const act = activityById(a.activity_id) || a;
+          day.appendChild(el('div',{
+            class:'ev'+((opts.conflicts||[]).includes(ds) ? ' conflict' : ''),
+            title:(act.activity_name||'Activity') + ' — click for details',
+            onclick:()=>showActivityModal(act),
+          }, (fmtTime(a.start_time)||'') + ' ' + ((act.activity_name||'').slice(0,18))));
+        });
+        revs.forEach(rev => day.appendChild(el('div',{
+          class:'ev review',
+          title:(rev.activity_name||rev.discipline||'Review') + ' — click for details',
+          onclick:()=>modal('Review session', reviewItem(rev), [el('button',{class:'btn',onclick:closeModal},'Close')]),
+        }, (fmtTime(rev.review_start_time)||'') + ' Review')));
+      }
     }
     cal.appendChild(day);
   }
   wrap.appendChild(cal);
+  // Footer hint when past events are being hidden in the current month.
+  if(hidePast && hiddenEventCount){
+    wrap.appendChild(el('div',{class:'muted',style:{fontSize:'.8rem',marginTop:'.3rem',textAlign:'right'}},
+      hiddenEventCount + ' past event' + (hiddenEventCount===1?'':'s') +
+      ' hidden this month — uncheck "Hide past dates" to show them.'));
+  }
   return wrap;
 }
 
@@ -1999,31 +2069,127 @@ function scheduleTable(rows){
   if(rows.length > 500) wrap.appendChild(el('div',{class:'muted',style:{padding:'.4rem'}},`Showing first 500 of ${rows.length}`));
   return wrap;
 }
+// Renders a comprehensive details view for any activity row.  Looks up the
+// canonical master_schedule entry by activity_id (if available) so a stub row
+// passed from e.g. the calendar still gets full field coverage.  Missing fields
+// are hidden rather than shown as blank labels.
 function showActivityModal(r){
-  const insts = State.data.assignments.filter(a => a.activity_id === r.activity_id);
-  const review = State.data.review_sessions.find(rv => rv.linked_activity_id === r.activity_id);
+  if(!r){ return; }
+  // Prefer the canonical master_schedule record so we surface description, cohort,
+  // worksheet_source, etc. even when the caller only had a stripped-down stub.
+  const canonical = r.activity_id ? (activityById(r.activity_id) || r) : r;
+  const merged = Object.assign({}, canonical, r);  // caller-provided fields win
+  const insts = State.data.assignments.filter(a => a.activity_id === merged.activity_id);
+  const review = State.data.review_sessions.find(rv => rv.linked_activity_id === merged.activity_id);
+  const reviewAttendance = (State.data.review_attendance||[])
+    .filter(a => review && a.review_id === review.review_id);
+
   const body = el('div',{});
-  body.appendChild(el('div',{class:'meta'},
-    el('span',null,fmtDateLong(r.date)),
-    el('span',null,`${fmtTime(r.start_time)}–${fmtTime(r.end_time)}`),
-    el('span',null,r.location||''),
-  ));
-  if(r.description) body.appendChild(el('p',null,r.description));
+
+  // ── Top-line metadata (date · time · location) ──────────────────
+  const topMeta = el('div',{class:'meta'});
+  if(merged.date) topMeta.appendChild(el('span',null, fmtDateLong(merged.date)));
+  if(merged.start_time || merged.end_time)
+    topMeta.appendChild(el('span',null,
+      `${fmtTime(merged.start_time)||'—'}–${fmtTime(merged.end_time)||'—'}`));
+  if(merged.location) topMeta.appendChild(el('span',null, merged.location));
+  if(topMeta.firstChild) body.appendChild(topMeta);
+
+  // ── Field grid: course / type / cohort / source / etc. ──────────
+  const detailRows = [
+    ['Course',         merged.course],
+    ['Module',         merged.module],
+    ['Discipline',     merged.discipline && merged.discipline !== merged.course ? merged.discipline : null],
+    ['Session type',   merged.activity_type],
+    ['Group / cohort', merged.cohort],
+    ['Required #',     merged.required_number_of_instructors],
+    ['Source sheet',   merged.worksheet_source],
+  ].filter(([,v]) => v != null && String(v).trim() !== '' && String(v) !== '0');
+  if(detailRows.length){
+    const tbl = el('table',{class:'tbl',style:{marginTop:'.5rem',fontSize:'.88rem'}});
+    detailRows.forEach(([k,v]) => tbl.appendChild(el('tr',{},
+      el('th',{style:{width:'40%'}}, k),
+      el('td',null, String(v)))));
+    body.appendChild(el('div',{class:'tbl-wrap'}, tbl));
+  }
+
+  // ── Description ────────────────────────────────────────────────
+  if(merged.description){
+    body.appendChild(el('h3',null,'Description'));
+    body.appendChild(el('p',{style:{whiteSpace:'pre-wrap'}}, merged.description));
+  }
+  // ── Notes / comments ───────────────────────────────────────────
+  if(merged.notes){
+    body.appendChild(el('h3',null,'Notes'));
+    body.appendChild(el('p',{style:{whiteSpace:'pre-wrap'}}, merged.notes));
+  }
+
+  // ── Assigned instructors (with department + role) ──────────────
   body.appendChild(el('h3',null,`Instructors (${insts.length})`));
-  if(!insts.length){ body.appendChild(el('div',{class:'note err'},'No instructor assigned.')); }
-  else {
-    const ul = el('ul');
+  if(!insts.length){
+    body.appendChild(el('div',{class:'note err'},'No instructor assigned.'));
+  } else {
+    const ul = el('ul',{style:{paddingLeft:'1.1rem',margin:'.3rem 0'}});
     insts.forEach(a => {
       const i = instructorById(a.instructor_id) || {};
-      ul.appendChild(el('li',null, `${i.full_name||'?'} ${a.role?'('+a.role+')':''}`));
+      const parts = [];
+      parts.push(i.full_name || '(unknown)');
+      const trailing = [];
+      if(a.role) trailing.push(a.role);
+      if(i.department) trailing.push(i.department);
+      if(a.is_active === false) trailing.push('inactive');
+      const line = parts[0] + (trailing.length ? ' — ' + trailing.join(' · ') : '');
+      ul.appendChild(el('li',null, line));
     });
     body.appendChild(ul);
   }
+
+  // ── Linked review session + attendance ─────────────────────────
   if(review){
     body.appendChild(el('h3',null,'Linked review session'));
     body.appendChild(reviewItem(review));
+    if(reviewAttendance.length){
+      body.appendChild(el('div',{class:'muted',style:{fontSize:'.82rem',marginTop:'.3rem'}},
+        reviewAttendance.length + ' attendance record(s) on file for this review.'));
+    }
   }
-  modal(r.activity_name || 'Activity', body, [el('button',{class:'btn',onclick:closeModal},'Close')]);
+
+  modal(merged.activity_name || merged.module || 'Activity', body,
+    [el('button',{class:'btn',onclick:closeModal},'Close')]);
+}
+// Modal listing every activity / review on a single day.  Used when the
+// calendar collapses past dates — clicking the "N past events" pill on a
+// day opens this list so the user can still drill down to a specific event.
+function showDayEventsModal(dateISO, assignments, reviews){
+  const body = el('div',{});
+  body.appendChild(el('div',{class:'meta'}, el('span',null, fmtDateLong(dateISO))));
+  if(!assignments.length && !reviews.length){
+    body.appendChild(el('div',{class:'empty'},'No events.'));
+  } else {
+    const list = el('div',{class:'list',style:{marginTop:'.4rem'}});
+    assignments.forEach(a => {
+      const act = activityById(a.activity_id) || a;
+      list.appendChild(el('button',{class:'item',onclick:()=>{closeModal(); showActivityModal(act);}},
+        el('div',{class:'item-title'},
+          (fmtTime(a.start_time)||'—') + ' · ' + (act.activity_name||'Activity')),
+        el('div',{class:'meta'},
+          el('span',null, act.activity_type||''),
+          el('span',null, act.location||''),
+          el('span',null, act.course||''),
+        )));
+    });
+    reviews.forEach(rev => {
+      list.appendChild(el('button',{class:'item',onclick:()=>{closeModal(); modal('Review session', reviewItem(rev), [el('button',{class:'btn',onclick:closeModal},'Close')]);}},
+        el('div',{class:'item-title'},
+          (fmtTime(rev.review_start_time)||'—') + ' · Review — ' + (rev.activity_name||rev.discipline||'')),
+        el('div',{class:'meta'},
+          el('span',null, rev.review_location||''),
+          el('span',null, rev.sg_code||''),
+        )));
+    });
+    body.appendChild(list);
+  }
+  modal('Events on ' + fmtDate(dateISO), body, [el('button',{class:'btn',onclick:closeModal},'Close')]);
 }
 
 function adminConflicts(main){
@@ -3120,9 +3286,20 @@ function adminImport(main){
         State.data.master_schedule.length+' activities · '+
         State.data.assignments.length+' assignments · '+
         State.data.review_sessions.length+' review sessions.';
+      // SG / Small-Group counts — useful for confirming the broadened SG detector picked them all up.
+      const sgActivities = (State.data.master_schedule||[]).filter(isSGActivity);
+      const sgActIds = new Set(sgActivities.map(a => a.activity_id));
+      const sgAssignments = (State.data.assignments||[]).filter(a => sgActIds.has(a.activity_id));
+      const sgInstructorIds = new Set(sgAssignments.map(a => a.instructor_id).filter(Boolean));
+      const sgActivitiesWithNoInstructor = sgActivities.filter(a =>
+        !sgAssignments.some(asgn => asgn.activity_id === a.activity_id));
       clear(uploadStatus);
       uploadStatus.appendChild(el('div',null, summary));
       uploadStatus.appendChild(el('div',{style:{marginTop:'.3rem'}}, 'Months detected: '+monthsList+'.'));
+      uploadStatus.appendChild(el('div',{style:{marginTop:'.3rem'}},
+        'Small Group activities found: '+sgActivities.length+
+        ' · assigned instructors (unique): '+sgInstructorIds.size+
+        ' · SG activities with no assigned instructor: '+sgActivitiesWithNoInstructor.length+'.'));
       toast('Imported '+files.length+' workbook'+(files.length!==1?'s':'')+' — refreshing','ok');
       clear(xlsPreview);
       xlsPreview.appendChild(el('div',{class:'kpi-grid'},
@@ -3439,231 +3616,377 @@ function renderSupervisingFacultyView(){
   const main = document.getElementById('main');
   clear(main);
 
+  // ── Header ────────────────────────────────────────────────────────────────
   const header = el('div',{class:'card'});
   header.appendChild(el('h2',null,'Supervising Faculty'));
   header.appendChild(el('div',{class:'muted',style:{fontSize:'.9rem',marginTop:'.3rem'}},
-    'Select a small group activity to see assigned instructors and find the best meeting time.'));
+    'Browse every Small Group / SG activity from the imported workbook, see assigned instructors, and find a common available meeting time.'));
   header.appendChild(el('button',{class:'btn secondary small',style:{marginTop:'.6rem'},onclick:()=>go('#welcome')}, '← Back'));
   main.appendChild(header);
 
-  // Strip cohort suffix like "(A)", "(B)", "(C)", "(D)" to get the base SG name
-  function baseSgName(name){ return (name||'').replace(/\s*\([A-Z]\)\s*$/,'').trim(); }
-
-  // All SG activities (including hidden-column ones — all columns are parsed)
-  const allSgActivities = State.data.master_schedule.filter(a =>
-    /SG|SGP/i.test(a.activity_type||'')
-  );
-
-  // Build activityId→baseName map and count unique instructors per base SG name
-  const actIdToBase = {};
-  allSgActivities.forEach(a => {
-    actIdToBase[a.activity_id] = baseSgName(a.activity_name||a.activity_id);
-  });
-
-  // For each base SG name, collect unique instructor IDs assigned across all cohorts
-  const baseInstructors = {}; // baseName → Set of instructor_ids
-  for(const asgn of State.data.assignments){
-    const base = actIdToBase[asgn.activity_id];
-    if(!base) continue;
-    if(!baseInstructors[base]) baseInstructors[base] = new Set();
-    baseInstructors[base].add(asgn.instructor_id);
-  }
-
-  // Only keep base SG groups with ≥4 unique instructors assigned
-  const MIN_INSTRUCTORS = 4;
-  const qualifiedBases = new Set(
-    Object.entries(baseInstructors)
-      .filter(([, ids]) => ids.size >= MIN_INSTRUCTORS)
-      .map(([base]) => base)
-  );
-
-  // sgActivities = only activities belonging to a qualified base group
-  const sgActivities = allSgActivities.filter(a =>
-    qualifiedBases.has(actIdToBase[a.activity_id])
-  );
-
-  if(!sgActivities.length){
+  // ── Collect all SG activities + lookup table for assigned instructor ids ─
+  const allSG = (State.data.master_schedule||[]).filter(isSGActivity)
+    .slice().sort((a,b) => (a.date||'').localeCompare(b.date||'') ||
+                            (a.start_time||'').localeCompare(b.start_time||''));
+  if(!allSG.length){
     main.appendChild(el('div',{class:'note warn'},
-      'No Small Group activities with '+MIN_INSTRUCTORS+' or more instructors assigned were found.'));
+      'No Small Group activities detected in the imported workbook. ' +
+      'The detector now matches: SG, SG1..SGn, "Small Group(s)", "B-Line", "Table Group", "Group #N" / "Group Number N" (any capitalisation/spacing).'));
     return;
   }
+  // activity_id → Set of instructor_ids assigned (treat all assignment rows as
+  // "this instructor has something on" — including absent/shadow, since they're
+  // not free for an extra meeting).
+  const assignedByActId = {};
+  for(const a of (State.data.assignments||[])){
+    if(!a.activity_id) continue;
+    if(!assignedByActId[a.activity_id]) assignedByActId[a.activity_id] = new Set();
+    if(a.instructor_id) assignedByActId[a.activity_id].add(a.instructor_id);
+  }
 
-  // Deduplicate by BASE name (merges cohort variants into one entry), qualified only
-  const seenBase = new Set();
-  const uniqueSG = [];
-  sgActivities.forEach(a => {
-    const base = baseSgName(a.activity_name||a.activity_id);
-    if(!seenBase.has(base)){ seenBase.add(base); uniqueSG.push({baseName: base, sample: a}); }
-  });
-  uniqueSG.sort((a,b)=>a.baseName.localeCompare(b.baseName));
+  // ── Filters ───────────────────────────────────────────────────────────────
+  const filterCard = el('div',{class:'card'});
+  filterCard.appendChild(el('h3',null,'Filters'));
 
-  const selCard = el('div',{class:'card'});
-  selCard.appendChild(el('h3',null,'Select Small Group Activity'));
-  const sgSel = el('select',{style:{marginBottom:'.6rem'}},
-    el('option',{value:''},'— Choose an activity —'),
-    ...uniqueSG.map(g=>el('option',{value:g.baseName}, g.baseName))
-  );
-  selCard.appendChild(sgSel);
-  const sgResult = el('div');
-  selCard.appendChild(sgResult);
-  main.appendChild(selCard);
+  const monthOptions = [...new Set(allSG.map(a => monthOf(a.date)).filter(Boolean))].sort();
+  const groupOptions = [...new Set(allSG.map(a => a.cohort).filter(Boolean))].sort();
+  const locOptions   = [...new Set(allSG.map(a => a.location).filter(Boolean))].sort();
+  const allInstructors = (State.data.instructors||[]).slice()
+    .sort((a,b) => (a.full_name||'').localeCompare(b.full_name||''));
+  const departments  = [...new Set(allInstructors.map(i => i.department).filter(Boolean))].sort();
 
-  sgSel.addEventListener('change',()=>{
-    clear(sgResult);
-    const baseName = sgSel.value; if(!baseName) return;
+  const fMonth = el('select',{},
+    el('option',{value:''},'All months'),
+    ...monthOptions.map(m => el('option',{value:m}, monthLabel(m))));
+  const fGroup = el('select',{},
+    el('option',{value:''},'All groups'),
+    ...groupOptions.map(g => el('option',{value:g}, g)));
+  const fInst = el('select',{},
+    el('option',{value:''},'All instructors'),
+    ...allInstructors.map(i => el('option',{value:i.instructor_id}, i.full_name)));
+  const fDept = el('select',{},
+    el('option',{value:''},'All departments'),
+    ...departments.map(d => el('option',{value:d}, d)));
+  const fLoc = el('select',{},
+    el('option',{value:''},'All locations'),
+    ...locOptions.map(l => el('option',{value:l}, l)));
+  const fSearch = el('input',{type:'search',placeholder:'activity name, source sheet…'});
+  const filtersRow = el('div',{style:{display:'grid',gap:'.4rem',
+    gridTemplateColumns:'repeat(auto-fit, minmax(160px,1fr))',marginTop:'.4rem'}});
+  function fLabel(label, ctrl){
+    return el('label',{style:{display:'block'}},
+      el('div',{class:'muted',style:{fontSize:'.78rem',marginBottom:'.15rem'}}, label), ctrl);
+  }
+  filtersRow.appendChild(fLabel('Month', fMonth));
+  filtersRow.appendChild(fLabel('Group / cohort', fGroup));
+  filtersRow.appendChild(fLabel('Instructor', fInst));
+  filtersRow.appendChild(fLabel('Department', fDept));
+  filtersRow.appendChild(fLabel('Location', fLoc));
+  filtersRow.appendChild(fLabel('Search', fSearch));
+  filterCard.appendChild(filtersRow);
+  main.appendChild(filterCard);
 
-    // Find ALL cohort variants (A/B/C/D and the base) with this base name
-    const sameNameActs = sgActivities.filter(a=>baseSgName(a.activity_name||'')===baseName);
-    const actIds = new Set(sameNameActs.map(a=>a.activity_id));
-    const assignedIds = [...new Set(
-      State.data.assignments.filter(a=>actIds.has(a.activity_id)).map(a=>a.instructor_id)
-    )];
-    const assignedInstructors = assignedIds.map(id=>instructorById(id)).filter(Boolean);
+  // ── Activity table ────────────────────────────────────────────────────────
+  const listCard = el('div',{class:'card'});
+  listCard.appendChild(el('h3',null,'Small Group Activities'));
+  const listHint = el('div',{class:'muted',style:{fontSize:'.85rem',marginBottom:'.4rem'}});
+  listCard.appendChild(listHint);
+  const selectAllRow = el('div',{class:'row',style:{gap:'.4rem',flexWrap:'wrap',marginBottom:'.4rem'}});
+  const btnSelectAll = el('button',{class:'btn small secondary'},'Select all shown');
+  const btnSelectNone = el('button',{class:'btn small secondary'},'Clear selection');
+  selectAllRow.appendChild(btnSelectAll);
+  selectAllRow.appendChild(btnSelectNone);
+  listCard.appendChild(selectAllRow);
+  const tableWrap = el('div',{class:'tbl-wrap'});
+  listCard.appendChild(tableWrap);
+  main.appendChild(listCard);
 
-    sgResult.appendChild(el('h3',null,'Assigned Instructors ('+assignedInstructors.length+')'));
-    if(!assignedInstructors.length){
-      sgResult.appendChild(el('div',{class:'empty'},'No instructors assigned to this activity.'));
-      return;
-    }
-    const list = el('div',{class:'list'});
-    assignedInstructors.forEach(i=>list.appendChild(el('div',{class:'item'},
-      el('div',{class:'item-title'},i.full_name),
-      el('div',{class:'meta'},el('span',null,i.department||''),el('span',null,i.email||''))
-    )));
-    sgResult.appendChild(list);
+  const selectedIds = new Set();
+  let currentFiltered = [];
 
-    // ── Suggested Review Time Slots ─────────────────────────────────────────────
-    const months = getAppScheduleMonths();
-    if(!months.length || !assignedIds.length) return;
-
-    // Activity-type duration table (minutes).
-    const ACT_DUR = { SG:120, SGP:120, ITI:180, SIM:240 };
-    const DEFAULT_ACT_DUR = 60;
-    // Usable daily blocks (minutes from midnight): 8–12 and 13–17, excluding lunch.
-    const DAY_BLOCKS = [{s:8*60,e:12*60},{s:13*60,e:17*60}];
-    const TOTAL_DAY_MIN = DAY_BLOCKS.reduce((t,b)=>t+(b.e-b.s),0); // 480 min = 8 h
-
-    function minToHHMM(m){ // e.g. 510 → "8:30 AM"
-      const h=Math.floor(m/60), mn=m%60;
-      const ap=h>=12?'PM':'AM', hr=h%12||12;
-      return hr+':'+(mn?String(mn).padStart(2,'0'):'00')+' '+ap;
-    }
-    function subtractInterval(blocks,s,e){
-      const out=[];
-      for(const b of blocks){
-        if(e<=b.s||s>=b.e){ out.push(b); continue; }
-        if(s>b.s) out.push({s:b.s,e:s});
-        if(e<b.e) out.push({s:e,e:b.e});
+  function applyFilters(){
+    const selMonth = fMonth.value;
+    const selGroup = fGroup.value;
+    const selInst  = fInst.value;
+    const selDept  = fDept.value;
+    const selLoc   = fLoc.value;
+    const q = fSearch.value.trim().toLowerCase();
+    return allSG.filter(a => {
+      if(selMonth && monthOf(a.date) !== selMonth) return false;
+      if(selGroup && (a.cohort||'') !== selGroup) return false;
+      if(selLoc   && (a.location||'') !== selLoc)  return false;
+      if(q && !(((a.activity_name||'').toLowerCase().includes(q)) ||
+                ((a.worksheet_source||'').toLowerCase().includes(q)) ||
+                ((a.cohort||'').toLowerCase().includes(q)))) return false;
+      const ids = assignedByActId[a.activity_id] || new Set();
+      if(selInst && !ids.has(selInst)) return false;
+      if(selDept){
+        const anyDept = [...ids].some(id => (instructorById(id)||{}).department === selDept);
+        if(!anyDept) return false;
       }
-      return out;
-    }
-    // Compute free time blocks for one instructor on one date.
-    function freeBlocksForInstructor(id,date){
-      let blocks=DAY_BLOCKS.map(b=>({s:b.s,e:b.e}));
-      const asgns=assignmentsForInstructor(id).filter(a=>a.date===date&&isActiveAssignment(a));
-      for(const a of asgns){
-        const act=activityById(a.activity_id)||{};
-        const atype=(act.activity_type||'').toUpperCase().trim();
-        let bs,be;
-        if(a.start_time&&a.end_time){
-          bs=timeToMin(a.start_time); be=timeToMin(a.end_time);
-        } else {
-          const dur=ACT_DUR[atype]||DEFAULT_ACT_DUR;
-          bs=blocks.length?blocks[0].s:8*60; be=bs+dur;
-        }
-        if(bs!=null&&be!=null) blocks=subtractInterval(blocks,bs,be);
-      }
-      return blocks;
-    }
-    function totalFreeMin(blocks){ return blocks.reduce((t,b)=>t+(b.e-b.s),0); }
-
-    // For a day, find time windows where the MAJORITY of instructors are free.
-    // Scan in 15-min slots; group consecutive majority-free slots into windows ≥ 30 min.
-    function groupFreeWindows(instrBlocks){
-      const majority=Math.ceil(instrBlocks.length/2);
-      const slots=[];
-      for(const blk of DAY_BLOCKS){
-        for(let t=blk.s;t<blk.e;t+=15){
-          const freeN=instrBlocks.filter(bs=>bs.some(b=>b.s<=t&&b.e>=t+15)).length;
-          slots.push({t,free:freeN>=majority,freeN});
-        }
-      }
-      const windows=[]; let ws=null;
-      for(let i=0;i<slots.length;i++){
-        const {t,free}=slots[i];
-        if(free&&ws===null) ws=t;
-        if((!free||i===slots.length-1)&&ws!==null){
-          const we=free?t+15:t;
-          if(we-ws>=30) windows.push({s:ws,e:we,dur:we-ws});
-          ws=null;
-        }
-      }
-      return windows;
-    }
-
-    // Gather candidates: weekdays in schedule months where majority have free time.
-    const candidates=[];
-    for(const ym of months){
-      const [yr,mo]=ym.split('-').map(Number);
-      const dim=new Date(yr,mo,0).getDate();
-      for(let day=1;day<=dim;day++){
-        const ds=yr+'-'+String(mo).padStart(2,'0')+'-'+String(day).padStart(2,'0');
-        if(new Date(ds+'T12:00:00').getDay()===0||new Date(ds+'T12:00:00').getDay()===6) continue;
-        const instrBlocks=assignedIds.map(id=>freeBlocksForInstructor(id,ds));
-        const freeCount=instrBlocks.filter(bs=>totalFreeMin(bs)>=60).length;
-        if(freeCount<=assignedIds.length/2) continue; // less than majority available
-        const windows=groupFreeWindows(instrBlocks);
-        if(!windows.length) continue;
-        const pct=Math.round(100*freeCount/assignedIds.length);
-        const maxFree=Math.max(...instrBlocks.map(bs=>totalFreeMin(bs)));
-        candidates.push({date:ds,freeCount,total:assignedIds.length,pct,windows,maxFree});
-      }
-    }
-
-    sgResult.appendChild(el('h3',null,'Suggested Review Times'));
-    if(!candidates.length){
-      sgResult.appendChild(el('div',{class:'note warn'},
-        'No date found where the majority of instructors have available review time.'));
-      return;
-    }
-    // Sort: most free instructors first, then longest free window, then earliest date.
-    candidates.sort((a,b)=>b.pct-a.pct||b.maxFree-a.maxFree||a.date.localeCompare(b.date));
-    const top=candidates.slice(0,10);
-    const best=top[0];
-
-    // Build results table with time-window detail.
-    const ftbl=el('table',{class:'tbl',style:{fontSize:'.82rem'}});
-    ftbl.appendChild(el('tr',{},
-      ...['Date','Free / Total','Available Windows','Free Hours'].map(h=>el('th',{},h))
-    ));
-    top.forEach((s,i)=>{
-      const isTop=i===0;
-      const windowsText=s.windows.map(w=>minToHHMM(w.s)+' – '+minToHHMM(w.e)).join('  |  ');
-      const freeHrs=(s.maxFree/60).toFixed(1)+'h';
-      ftbl.appendChild(el('tr',{style:isTop?{background:'var(--green-soft)'}:{}},
-        el('td',{},fmtDateLong(s.date)+(isTop?' ⭐':'') ),
-        el('td',{},el('span',{class:'badge '+(s.pct>=80?'green':s.pct>=60?'yellow':'gray')},
-          s.freeCount+' / '+s.total)),
-        el('td',{style:{whiteSpace:'nowrap'}}, windowsText||'—'),
-        el('td',{}, freeHrs)
-      ));
+      return true;
     });
-    sgResult.appendChild(el('div',{class:'tbl-wrap'},ftbl));
+  }
 
-    // Best-option callout with full window detail.
-    const bestWindows=best.windows.map(w=>minToHHMM(w.s)+' – '+minToHHMM(w.e)).join(', ');
-    sgResult.appendChild(el('div',{class:'note',style:{marginTop:'.6rem'}},
-      el('strong',null,'Best option: '),
-      fmtDateLong(best.date)+' — ',
-      el('span',null,best.freeCount+' of '+best.total+' instructors free ('+best.pct+'%).'),
-      el('br'),
-      el('strong',null,'Available windows: '),
-      el('span',null,bestWindows),
-      el('br'),
-      el('span',{class:'muted',style:{fontSize:'.88rem'}},
-        'Lunch (12:00 PM – 1:00 PM) excluded. Activity durations: SG/SGP = 2 h, ITI = 3 h, SIM = 4 h.')
-    ));
-  });
+  function renderTable(){
+    currentFiltered = applyFilters();
+    clear(tableWrap);
+    listHint.textContent = currentFiltered.length + ' SG activit'+
+      (currentFiltered.length===1?'y':'ies')+' shown · '+selectedIds.size+' selected.';
+    if(!currentFiltered.length){
+      tableWrap.appendChild(el('div',{class:'empty'},'No activities match the current filters.'));
+      return;
+    }
+    const t = el('table',{class:'tbl'});
+    t.appendChild(el('tr',{},
+      el('th',null,''), el('th',null,'Date'), el('th',null,'Time'),
+      el('th',null,'Activity'), el('th',null,'Group'),
+      el('th',null,'Location'), el('th',null,'Instructors'),
+      el('th',null,'Source sheet')));
+    currentFiltered.slice(0, 500).forEach(a => {
+      const ids = [...(assignedByActId[a.activity_id] || new Set())];
+      const names = ids.map(id => (instructorById(id)||{}).full_name).filter(Boolean);
+      const cb = el('input',{type:'checkbox'});
+      cb.checked = selectedIds.has(a.activity_id);
+      cb.onclick = (e) => {
+        e.stopPropagation();
+        if(cb.checked) selectedIds.add(a.activity_id);
+        else selectedIds.delete(a.activity_id);
+        listHint.textContent = currentFiltered.length + ' SG activit'+
+          (currentFiltered.length===1?'y':'ies')+' shown · '+selectedIds.size+' selected.';
+      };
+      const tr = el('tr',{onclick:(e)=>{ if(e.target.tagName!=='INPUT') showActivityModal(a); }},
+        el('td',null, cb),
+        el('td',null, fmtDate(a.date)),
+        el('td',null, (fmtTime(a.start_time)||'')+(a.end_time?'–'+fmtTime(a.end_time):'')),
+        el('td',null, a.activity_name||''),
+        el('td',null, a.cohort||''),
+        el('td',null, a.location||''),
+        el('td',null, ids.length + (names.length ? ' · '+names.slice(0,3).join(', ')+(names.length>3?'…':'') : '')),
+        el('td',null, a.worksheet_source||''),
+      );
+      tr.style.cursor = 'pointer';
+      t.appendChild(tr);
+    });
+    tableWrap.appendChild(t);
+    if(currentFiltered.length > 500){
+      tableWrap.appendChild(el('div',{class:'muted',style:{fontSize:'.82rem',marginTop:'.3rem'}},
+        '(showing first 500 of '+currentFiltered.length+' — narrow filters to see the rest)'));
+    }
+  }
+  [fMonth,fGroup,fInst,fDept,fLoc].forEach(s => s.addEventListener('change', renderTable));
+  fSearch.addEventListener('input', debounce(renderTable, 150));
+  btnSelectAll.onclick  = () => { currentFiltered.forEach(a => selectedIds.add(a.activity_id)); renderTable(); };
+  btnSelectNone.onclick = () => { selectedIds.clear(); renderTable(); };
+  renderTable();
+
+  // ── Recommendation engine ─────────────────────────────────────────────────
+  const recCard = el('div',{class:'card'});
+  recCard.appendChild(el('h3',null,'Find best available time'));
+  recCard.appendChild(el('div',{class:'muted',style:{fontSize:'.85rem'}},
+    'Tick the SG activities you supervise (above), pick a slot length, then click Find. ' +
+    'The app scans every weekday in the imported schedule months between 8:00 AM and 5:00 PM (lunch 12:00–1:00 PM excluded) ' +
+    'and ranks slots by how many of the assigned instructors are free. An instructor is "unavailable" if they are: '+
+    'teaching another activity, in another SG, assigned to a review session, or on approved leave / imported LOA.'));
+  // Slot length picker
+  const slotWrap = el('div',{class:'row',style:{marginTop:'.5rem',gap:'.8rem',flexWrap:'wrap'}});
+  const radioName = 'sf-slot-len-'+Date.now();
+  const r30 = el('input',{type:'radio',name:radioName,value:'30'});
+  const r60 = el('input',{type:'radio',name:radioName,value:'60'}); r60.checked = true;
+  slotWrap.appendChild(el('label',{style:{display:'flex',alignItems:'center',gap:'.3rem',cursor:'pointer'}}, r30, '30-minute slots'));
+  slotWrap.appendChild(el('label',{style:{display:'flex',alignItems:'center',gap:'.3rem',cursor:'pointer'}}, r60, '60-minute slots'));
+  // Past-date toggle: by default skip past dates (no point recommending them)
+  const inclPast = el('input',{type:'checkbox'});
+  slotWrap.appendChild(el('label',{style:{display:'flex',alignItems:'center',gap:'.3rem',cursor:'pointer'}}, inclPast, 'Include past dates'));
+  recCard.appendChild(slotWrap);
+  const findBtn = el('button',{class:'btn',style:{marginTop:'.6rem'}},'Find best available time');
+  recCard.appendChild(findBtn);
+  const recResult = el('div'); recCard.appendChild(recResult);
+  main.appendChild(recCard);
+
+  function minToHHMM(m){
+    const h = Math.floor(m/60), mn = m%60;
+    const ap = h>=12 ? 'PM' : 'AM', hr = h%12 || 12;
+    return hr+':'+String(mn).padStart(2,'0')+' '+ap;
+  }
+
+  findBtn.onclick = () => {
+    clear(recResult);
+    if(!selectedIds.size){
+      recResult.appendChild(el('div',{class:'note warn',style:{marginTop:'.6rem'}},
+        'Tick at least one SG activity in the table above first.'));
+      return;
+    }
+    // Aggregate the unique set of assigned instructor IDs from all selected SGs.
+    const instIds = new Set();
+    for(const aid of selectedIds){
+      const ids = assignedByActId[aid];
+      if(ids) ids.forEach(id => instIds.add(id));
+    }
+    if(!instIds.size){
+      recResult.appendChild(el('div',{class:'note warn',style:{marginTop:'.6rem'}},
+        'The selected SG activities have no assigned instructors in the imported data.'));
+      return;
+    }
+    const slotLen = +document.querySelector('input[name="'+radioName+'"]:checked').value;
+    const months = getAppScheduleMonths();
+    if(!months.length){
+      recResult.appendChild(el('div',{class:'note warn',style:{marginTop:'.6rem'}},
+        'No schedule months are loaded — import a workbook first.'));
+      return;
+    }
+
+    // ── Precompute occupied intervals per instructor per date ───────────────
+    // Source 1: assignments (teaching / SG / shadow / absent — all count as
+    // "unavailable" because the instructor is either in a room or off duty).
+    const asgnByInstDate = {}; // [instId][date] = [{s,e,role}]
+    const wholeDayOff = {};    // [instId][date] = 'absent'|'off duty'
+    for(const a of (State.data.assignments||[])){
+      if(!a.instructor_id || !a.date) continue;
+      const roleLower = (a.role||'').toLowerCase().trim();
+      if(/^(absent\s+all\s+day|e\.absent\s+all\s+day|off\s+duty|off)$/.test(roleLower)){
+        if(!wholeDayOff[a.instructor_id]) wholeDayOff[a.instructor_id] = {};
+        wholeDayOff[a.instructor_id][a.date] = roleLower;
+        continue;  // don't also push an interval — whole-day flag is enough
+      }
+      const s = timeToMin(a.start_time), e = timeToMin(a.end_time);
+      if(s == null || e == null) continue;
+      if(!asgnByInstDate[a.instructor_id]) asgnByInstDate[a.instructor_id] = {};
+      if(!asgnByInstDate[a.instructor_id][a.date]) asgnByInstDate[a.instructor_id][a.date] = [];
+      asgnByInstDate[a.instructor_id][a.date].push({s, e, role: a.role||''});
+    }
+    // Source 2: review sessions (via review_attendance).  Assume 60-min duration
+    // when the workbook doesn't specify an end time.
+    for(const att of (State.data.review_attendance||[])){
+      const rev = (State.data.review_sessions||[]).find(r => r.review_id === att.review_id);
+      if(!rev || !rev.review_date || !rev.review_start_time) continue;
+      const s = timeToMin(rev.review_start_time);
+      if(s == null) continue;
+      const e = s + 60;
+      const id = att.instructor_id;
+      if(!asgnByInstDate[id]) asgnByInstDate[id] = {};
+      if(!asgnByInstDate[id][rev.review_date]) asgnByInstDate[id][rev.review_date] = [];
+      asgnByInstDate[id][rev.review_date].push({s, e, role: 'review'});
+    }
+    // Source 3: approved leave_requests (matched + imported_loa).
+    const leaveDays = {};  // [instId] = Set of dates
+    for(const lr of (State.data.leave_requests||[])){
+      if(lr.status !== 'approved' || !lr.instructor_id) continue;
+      const days = dateRange(lr.start_date, lr.end_date);
+      if(!leaveDays[lr.instructor_id]) leaveDays[lr.instructor_id] = new Set();
+      days.forEach(d => leaveDays[lr.instructor_id].add(d));
+    }
+    // Source 4: legacy State.loaData (keyed by full_name).
+    const loaByName = {};
+    (State.loaData||[]).forEach(e => { loaByName[e.name] = new Set(e.dates||[]); });
+    function isOnLeave(instId, ds){
+      if(leaveDays[instId] && leaveDays[instId].has(ds)) return true;
+      const inst = instructorById(instId);
+      if(inst && loaByName[inst.full_name] && loaByName[inst.full_name].has(ds)) return true;
+      return false;
+    }
+    function overlapsBooking(instId, ds, slotS, slotE){
+      const ivs = (asgnByInstDate[instId]||{})[ds] || [];
+      for(const iv of ivs){
+        if(iv.s < slotE && slotS < iv.e) return iv;
+      }
+      return null;
+    }
+
+    // ── Walk weekdays × slot grid ────────────────────────────────────────────
+    const DAY_BLOCKS = [{s:8*60, e:12*60}, {s:13*60, e:17*60}];
+    const todayISO = new Date().toISOString().slice(0,10);
+    const includePast = inclPast.checked;
+    const instIdArr = [...instIds];
+    const candidates = [];
+    for(const ym of months){
+      const [yr, mo] = ym.split('-').map(Number);
+      const lastDayOfMonth = new Date(yr, mo, 0).getDate();
+      for(let day=1; day<=lastDayOfMonth; day++){
+        const ds = yr+'-'+String(mo).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+        if(!includePast && ds < todayISO) continue;
+        const dow = new Date(ds+'T12:00:00').getDay();
+        if(dow === 0 || dow === 6) continue;  // skip weekends
+        for(const blk of DAY_BLOCKS){
+          for(let t=blk.s; t+slotLen<=blk.e; t+=slotLen){
+            const slotS = t, slotE = t+slotLen;
+            const avail = [], unavail = [];
+            for(const id of instIdArr){
+              if(wholeDayOff[id] && wholeDayOff[id][ds]){
+                unavail.push({id, reason: wholeDayOff[id][ds]}); continue;
+              }
+              if(isOnLeave(id, ds)){
+                unavail.push({id, reason: 'on leave'}); continue;
+              }
+              const conf = overlapsBooking(id, ds, slotS, slotE);
+              if(conf){
+                unavail.push({id, reason: conf.role || 'booked'}); continue;
+              }
+              avail.push(id);
+            }
+            candidates.push({
+              date: ds, slotS, slotE,
+              avail, unavail,
+              count: avail.length, total: instIdArr.length,
+              pct: Math.round(100 * avail.length / instIdArr.length),
+            });
+          }
+        }
+      }
+    }
+    if(!candidates.length){
+      recResult.appendChild(el('div',{class:'note warn',style:{marginTop:'.6rem'}},
+        'No weekday slots found in the imported schedule months'+
+        (includePast?'':' on or after today')+'.'));
+      return;
+    }
+    // Sort: highest available count first, then earliest date, then earliest slot.
+    candidates.sort((a,b) => b.count - a.count
+      || a.date.localeCompare(b.date)
+      || a.slotS - b.slotS);
+    const top = candidates.slice(0, 10);
+
+    recResult.appendChild(el('h3',{style:{marginTop:'.8rem'}},
+      'Top '+top.length+' option'+(top.length===1?'':'s')+' · '+
+      instIdArr.length+' instructor'+(instIdArr.length===1?'':'s')+
+      ' from '+selectedIds.size+' SG activit'+(selectedIds.size===1?'y':'ies')));
+
+    top.forEach((c, i) => {
+      const isBest = i === 0;
+      const summary = (isBest?'⭐ ':'') +
+        fmtDateLong(c.date) + ', ' + minToHHMM(c.slotS) + '–' + minToHHMM(c.slotE) +
+        ' — ' + c.count + ' of ' + c.total + ' instructors available (' + c.pct + '%)';
+      const det = el('details',{style:{
+        border:'1px solid var(--border)',borderRadius:'var(--radius)',
+        padding:'.5rem .7rem',marginTop:'.4rem',
+        background: isBest ? 'var(--green-soft)' : 'var(--surface)'}});
+      if(isBest) det.setAttribute('open',''); // expand best by default
+      const sum = el('summary',{style:{cursor:'pointer',fontWeight:600}});
+      sum.appendChild(document.createTextNode(summary));
+      det.appendChild(sum);
+
+      const availNames = c.avail.map(id => (instructorById(id)||{}).full_name).filter(Boolean)
+        .sort((a,b)=>a.localeCompare(b));
+      const unavailRows = c.unavail.map(o => {
+        const inst = instructorById(o.id) || {};
+        return { name: inst.full_name || '(unknown)', reason: o.reason };
+      }).sort((a,b)=>a.name.localeCompare(b.name));
+
+      const body = el('div',{style:{marginTop:'.4rem',fontSize:'.85rem',display:'grid',gap:'.3rem'}});
+      body.appendChild(el('div',null,
+        el('strong',null, 'Available ('+availNames.length+'): '),
+        el('span',null, availNames.join(', ') || '—')));
+      body.appendChild(el('div',null,
+        el('strong',null, 'Unavailable ('+unavailRows.length+'): '),
+        el('span',null, unavailRows.map(r => r.name+' ('+r.reason+')').join(', ') || '—')));
+      det.appendChild(body);
+      recResult.appendChild(det);
+    });
+
+    recResult.appendChild(el('div',{class:'muted',style:{fontSize:'.8rem',marginTop:'.5rem'}},
+      'Slot length: '+slotLen+' min. Working hours: 8:00 AM – 5:00 PM (lunch 12:00–1:00 PM excluded). '+
+      'Weekends skipped. '+(includePast?'Past dates included.':'Past dates skipped (toggle "Include past dates" to see them).')));
+  };
 }
 
 function adminExport(main){
@@ -3970,7 +4293,7 @@ function detectOutsideHours(){
 function detectSgWithoutReview(){
   const linkedActIds = new Set(State.data.review_sessions.map(r => r.linked_activity_id).filter(Boolean));
   return State.data.master_schedule
-    .filter(a => /SG|SGP/i.test(a.activity_type||''))
+    .filter(isSGActivity)
     .filter(a => !linkedActIds.has(a.activity_id))
     .filter(a => !State.overrides['sgnorev|'+a.activity_id]);
 }
@@ -4339,7 +4662,10 @@ function parseWorkbook(wb){
     if(s.includes('ultrasound')) return 'Ultrasound';
     if(s.includes('sim')) return 'SIM';
     if(s.includes('case')) return 'Case';
-    if(/\bsg\b|\bsg\d+/.test(s)) return 'SG';
+    // Broad SG detection — also covers Small Group(s), B-Line, Table Group, Group #N / Group Number N.
+    // Variations seen in real workbooks: "SG", "SG1", "Small Groups", "B-line session", "Table Group",
+    // "Group 3", "Group #4", "Group Number 5", and various spacings/capitalisations.
+    if(/\bsg\b|\bsg\d+|small\s*-?\s*groups?|small\s*group\s*session|b\s*-?\s*line|table\s*group|\bgroup\s*(?:#|no\.?|number)?\s*\d+/.test(s)) return 'SG';
     return 'Session';
   }
   function deriveDuration(sessionName){
@@ -4481,7 +4807,7 @@ function parseWorkbook(wb){
     const sg = (r.sg_code||'').toLowerCase().replace(/\s+/g,'').replace('sg','');
     if(!sg) continue;
     const found = data.master_schedule.find(a =>
-      /SG|SGP/i.test(a.activity_type||'') &&
+      isSGActivity(a) &&
       (a.activity_name||'').toLowerCase().replace(/\s+/g,'').replace('sg','').includes(sg)
     );
     if(found) r.linked_activity_id = found.activity_id;
