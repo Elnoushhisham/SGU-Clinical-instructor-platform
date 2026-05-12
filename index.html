@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8">
 <title>SGU Clinical Instructors Admin Site — Year 2 Spring 2026</title>
+<!-- Cache-control: best-effort hint to browsers (esp. mobile + iOS home-screen)
+     not to serve a stale shell. The service worker + APP_VERSION check below
+     are the real defenses; these meta tags just reduce HTTP-cache surprises. -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<meta name="app-version" content="2026-05-12-01">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#b2093b">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -310,6 +317,91 @@ const DEPT_PASSCODES = {
 };
 const SUPERVISING_PASSCODE = "super123"; // Supervising Faculty passcode
 const STORE_KEY = "clinical_roster_v2";
+
+/* ---- APP_VERSION: bump this on every deploy ---------------------------
+   Convention: YYYY-MM-DD-NN. Must match <meta name="app-version">.
+   When the value here is newer than the version last seen on this device,
+   the app wipes stale HTTP/SW caches and reloads once with a cache-bust
+   query string. Locally-saved user data (leave requests, settings) is
+   preserved through that reload.
+----------------------------------------------------------------------- */
+const APP_VERSION = "2026-05-12-01";
+const APP_VERSION_KEY = "clinical_roster_app_version";
+const APP_VERSION_RELOAD_GUARD = "clinical_roster_appver_reloaded";
+
+function getStoredAppVersion(){
+  try{ return localStorage.getItem(APP_VERSION_KEY); }catch(e){ return null; }
+}
+function setStoredAppVersion(v){
+  try{ localStorage.setItem(APP_VERSION_KEY, v); }catch(e){}
+}
+function isStandaloneApp(){
+  try{
+    return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+        || window.navigator.standalone === true;
+  }catch(e){ return false; }
+}
+
+// Wipe HTTP/SW caches on this device. Leaves localStorage (user data) intact.
+async function wipeShellCaches(){
+  try{
+    if('caches' in window){
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k).catch(()=>{})));
+    }
+  }catch(e){}
+  try{
+    if(navigator.serviceWorker && navigator.serviceWorker.getRegistrations){
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister().catch(()=>{})));
+    }
+  }catch(e){}
+}
+
+// Reload with a cache-busting query param so the browser HTTP cache is bypassed.
+function reloadWithCacheBust(){
+  try{
+    const u = new URL(location.href);
+    u.searchParams.set('v', APP_VERSION);
+    u.searchParams.set('_cb', String(Date.now()));
+    location.replace(u.toString());
+  }catch(e){ location.reload(); }
+}
+
+// Runs before bootstrap. If the live APP_VERSION differs from what was last
+// seen on this device, we drop shell caches and reload once. Returns true
+// when a reload has been kicked off so the caller can bail out.
+async function handleAppVersionUpgrade(){
+  let stored = null;
+  try{ stored = localStorage.getItem(APP_VERSION_KEY); }catch(e){}
+  if(stored === APP_VERSION) return false;
+
+  if(stored == null){
+    // First run on this device — adopt the version silently, no reload needed.
+    setStoredAppVersion(APP_VERSION);
+    return false;
+  }
+
+  // Guard against infinite reload loops if cache-busting somehow fails.
+  let alreadyReloaded = false;
+  try{ alreadyReloaded = sessionStorage.getItem(APP_VERSION_RELOAD_GUARD) === APP_VERSION; }catch(e){}
+  if(alreadyReloaded){
+    setStoredAppVersion(APP_VERSION);
+    return false;
+  }
+
+  await wipeShellCaches();
+  setStoredAppVersion(APP_VERSION);
+  try{ sessionStorage.setItem(APP_VERSION_RELOAD_GUARD, APP_VERSION); }catch(e){}
+
+  // Installed PWA / home-screen users get a one-line heads-up before we reload,
+  // since they typically can't see a refresh spinner.
+  if(isStandaloneApp()){
+    try{ alert('A new version of the SGU Roster app is available (' + APP_VERSION + ').\n\nTap OK to reload with the latest data.'); }catch(e){}
+  }
+  reloadWithCacheBust();
+  return true;
+}
 
 const State = {
   data: null,        // { instructors, master_schedule, review_sessions, assignments, review_attendance, ... }
@@ -951,8 +1043,40 @@ function renderWelcome(){
     el('span',{class:'divider'}),
     el('span',null,'Grenada, West Indies'),
   ));
+  // Build/data fingerprint — surfaces version mismatches on phone vs. laptop.
+  wrap.appendChild(buildVersionFooter());
 
   main.appendChild(wrap);
+}
+
+// Returns a small block displaying App version, Data version, and Last synced.
+// Used on the welcome screen and inside Coordinator → Import.
+function buildVersionFooter(){
+  const meta = (State.data && State.data.meta) || {};
+  const dataVersion = meta.parsed_at || meta.published_at || meta.generated_at || '(embedded seed)';
+  const lastSynced = State.settings && State.settings.lastSyncedAt
+    ? new Date(State.settings.lastSyncedAt).toLocaleString() + ' (' + fmtRelativeTime(State.settings.lastSyncedAt) + ')'
+    : 'never';
+  const box = el('div',{class:'muted', style:{
+    margin:'1rem auto 0',padding:'.55rem .8rem',fontSize:'.72rem',
+    textAlign:'center',maxWidth:'520px',lineHeight:'1.5',
+    border:'1px dashed var(--border)', borderRadius:'8px',
+    background:'var(--surface-2)'
+  }});
+  box.appendChild(el('div',null,
+    el('strong',null,'App version: '),
+    el('span',null, APP_VERSION),
+    isStandaloneApp() ? el('span',{style:{marginLeft:'.4rem'}}, '· home-screen install') : ''
+  ));
+  box.appendChild(el('div',null,
+    el('strong',null,'Data version: '),
+    el('span',null, String(dataVersion))
+  ));
+  box.appendChild(el('div',null,
+    el('strong',null,'Last synced: '),
+    el('span',null, lastSynced)
+  ));
+  return box;
 }
 function roleCard(emoji, label, desc, onclick){
   return el('button', {class:'role-card', onclick},
@@ -3500,21 +3624,34 @@ function adminImport(main){
     if(!confirm('Clear ALL local saved data on this device and reload the latest available data?\n\n' +
                 'This wipes the locally cached roster, settings overrides, and the leave requests stored on this device. ' +
                 'After reload the app will fetch the published JSON (if a URL is saved), or fall back to the embedded seed.')) return;
+    // 1. localStorage app data (full wipe, including version marker so the
+    //    next load is treated as a fresh install).
     try{ await Storage.clear(); }catch(e){}
+    try{ localStorage.removeItem(APP_VERSION_KEY); }catch(e){}
+    try{ localStorage.removeItem(STORE_KEY+'_recent'); }catch(e){}
+    // 2. IndexedDB databases (any app + library databases left over).
     try{ if(window.indexedDB && indexedDB.databases){
       const dbs = await indexedDB.databases();
       for(const db of dbs){ if(db && db.name) try{ indexedDB.deleteDatabase(db.name); }catch(e){} }
     }}catch(e){}
+    // 3. Cache Storage (Service Worker caches).
     try{ if('caches' in window){
       const keys = await caches.keys();
       for(const k of keys) try{ await caches.delete(k); }catch(e){}
     }}catch(e){}
-    // Force a hard reload that bypasses HTTP cache so the next bootstrap fetches fresh JSON.
-    const u = new URL(location.href);
-    u.searchParams.set('_cb', String(Date.now()));
-    location.replace(u.toString());
+    // 4. Unregister any installed service worker so the next load fetches a
+    //    fresh shell straight from GitHub Pages.
+    try{ if(navigator.serviceWorker && navigator.serviceWorker.getRegistrations){
+      const regs = await navigator.serviceWorker.getRegistrations();
+      for(const r of regs) try{ await r.unregister(); }catch(e){}
+    }}catch(e){}
+    // 5. Hard reload that bypasses HTTP cache so the next bootstrap fetches fresh JSON.
+    reloadWithCacheBust();
   }},'🗑 Clear local saved data and reload latest'));
   syncCard.appendChild(syncBtns);
+  // Show App version / Data version / Last synced right under the sync controls
+  // so coordinators can confirm phone & laptop are on the same build.
+  syncCard.appendChild(buildVersionFooter());
   masterPanel.appendChild(syncCard);
 
   /* ─── 1. Fetch from published JSON URL ─────────────────────── */
@@ -5366,16 +5503,39 @@ document.getElementById('btn-search').addEventListener('click', () => {
   setTimeout(()=>inp.focus(), 150);
 });
 
-/* -------- 14. SERVICE WORKER (minimal, optional) ------- */
+/* -------- 14. SERVICE WORKER (minimal, optional) -------
+   Network-first for everything; HTML + roster-data.json are forced to
+   bypass even the HTTP cache. On activation we delete every cached
+   response so old builds never re-serve stale content. */
 if('serviceWorker' in navigator && location.protocol !== 'file:'){
-  // Register a minimal in-page worker via Blob so the app can be installed on Android.
-  // iOS already supports "Add to home screen" without SW.
-  const swCode = `
+  // SW source is templated with APP_VERSION so the registered worker
+  // changes URL on every deploy; the browser then fetches the new
+  // worker and triggers its 'install' / 'activate' lifecycle.
+  const swCode = "/* SGU Roster SW " + APP_VERSION + " */\n" + `
     self.addEventListener('install', e => self.skipWaiting());
-    self.addEventListener('activate', e => self.clients.claim());
+    self.addEventListener('activate', e => {
+      e.waitUntil((async () => {
+        try{
+          const keys = await caches.keys();
+          await Promise.all(keys.map(k => caches.delete(k)));
+        }catch(err){}
+        try{ await self.clients.claim(); }catch(err){}
+      })());
+    });
     self.addEventListener('fetch', e => {
       if(e.request.method !== 'GET') return;
-      e.respondWith(fetch(e.request).catch(()=>caches.match(e.request)));
+      const url = new URL(e.request.url);
+      const path = url.pathname.toLowerCase();
+      const isShell = e.request.mode === 'navigate'
+                   || path.endsWith('/') || path.endsWith('.html')
+                   || path.endsWith('.json');
+      if(isShell){
+        // Pure network — never serve a cached HTML or JSON, even offline.
+        e.respondWith(fetch(e.request, {cache:'no-store'}));
+      } else {
+        // Static assets: network-first, fall back to whatever might be cached.
+        e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+      }
     });
   `;
   try{
@@ -5386,7 +5546,16 @@ if('serviceWorker' in navigator && location.protocol !== 'file:'){
 }
 
 /* -------- 15. KICK OFF --------------------------------- */
-bootstrap();
+(async function(){
+  // Detect deployed-version change BEFORE bootstrap so we wipe stale
+  // shell/SW caches and reload exactly once — keeps mobile devices
+  // (especially home-screen PWA installs) from sticking on an old build.
+  try{
+    const reloading = await handleAppVersionUpgrade();
+    if(reloading) return;
+  }catch(e){ console.warn('version-check failed', e); }
+  bootstrap();
+})();
 </script>
 </body>
 </html>
