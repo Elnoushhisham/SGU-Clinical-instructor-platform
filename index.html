@@ -417,6 +417,9 @@ const State = {
     hidePastDates: true,  // collapse past dates in the calendar (display-only; data is untouched)
     lastSyncedAt: null,
     lastSyncError: '',
+    lastImportedAt: null,         // set whenever Excel is imported on this device
+    dataSource: 'seed',           // 'published' | 'local' | 'json-backup' | 'seed'
+    publishedAt: null,            // meta.published_at observed from the last fetched JSON
     coordinatorEmail: 'clinicaltutorsyear2@sgu.edu',
     deptPasscodes: {},        // overrides for dept chair passwords (keyed by dept name)
     supervisingPasscode: '',  // override for supervising faculty password
@@ -630,8 +633,10 @@ function hasOverlappingLeave(instructorId, startISO, endISO, excludeRequestId){
 }
 
 /* -------- Periodic-publish JSON fetch ----------------------- */
-async function fetchFromDataUrl(url){
+async function fetchFromDataUrl(url, opts){
   if(!url) throw new Error('No data URL configured');
+  opts = opts || {};
+  const force = !!opts.force;          // manual "Refresh" buttons pass force:true
   // Cache-bust the URL: combine cache:'no-store' with a per-request timestamp param
   // so neither the browser nor the GitHub Pages / CDN edge serves a stale copy.
   const bustUrl = url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
@@ -639,21 +644,63 @@ async function fetchFromDataUrl(url){
   try{ resp = await fetch(bustUrl, {cache:'no-store', headers:{'Cache-Control':'no-cache'}}); }
   catch(e){ throw new Error('Network error: ' + (e.message||e)); }
   if(!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + resp.statusText);
-  let newData;
-  try{ newData = await resp.json(); }
+  let envelope;
+  try{ envelope = await resp.json(); }
   catch(e){ throw new Error('Response is not valid JSON: ' + (e.message||e)); }
-  // Support bare data object or {data:…} envelope
-  if(newData.data && newData.data.instructors) newData = newData.data;
-  if(!newData.instructors || !Array.isArray(newData.instructors))
+
+  // Recognised envelope shapes:
+  //   1. Full export bundle: { __format:'sgu-roster-data', data:{...}, loaData, irregularityData, commendationData, approvedLeaveImported, overrides }
+  //   2. {data:{...}} envelope
+  //   3. Bare roster dataset { instructors, master_schedule, ... }
+  const isFullBundle = envelope && envelope.__format === 'sgu-roster-data' && envelope.data;
+  let newData = isFullBundle ? envelope.data
+              : (envelope && envelope.data && envelope.data.instructors) ? envelope.data
+              : envelope;
+  if(!newData || !newData.instructors || !Array.isArray(newData.instructors))
     throw new Error('JSON does not contain an instructors array — check the URL.');
+
+  // Newer-wins guard: if our local data is strictly fresher than the
+  // fetched payload (e.g. coordinator just imported Excel but hasn't
+  // published yet), keep the local copy and surface a warning to the UI.
+  const localFresh = dataFreshness(State.data);
+  const pubFresh = dataFreshness(newData);
+  if(!force && localFresh && pubFresh && localFresh > pubFresh){
+    State.settings.lastSyncError = 'Published JSON is older than local data — kept local copy.';
+    State.settings.dataSource = 'local';
+    await persist();
+    const err = new Error('Local data is newer than published JSON; not overwriting.');
+    err.code = 'LOCAL_NEWER';
+    throw err;
+  }
+
+  // Preserve user-entered pending leave requests across the swap. Imported
+  // (approved) leaves from the published bundle replace the imported slice
+  // via mergeLeaveRequests (dedupes by stable fingerprint id).
   const existingLeave = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
-  newData.leave_requests = existingLeave;
+  const pendingLocalLeaves = existingLeave.filter(r =>
+    !(r.source && String(r.source).startsWith('imported:')) && r.status !== 'cancelled');
+  newData.leave_requests = mergeLeaveRequests(pendingLocalLeaves, newData.leave_requests || []);
   normalizeImportedJson(newData);
   State.data = newData;
+
+  // Restore optional slices from a full-bundle export so every device sees
+  // the same irregularity / commendation / LOA / approved-leave records.
+  if(isFullBundle){
+    if(Array.isArray(envelope.loaData)) State.loaData = envelope.loaData;
+    if(Array.isArray(envelope.irregularityData)) State.irregularityData = envelope.irregularityData;
+    if(Array.isArray(envelope.commendationData)) State.commendationData = envelope.commendationData;
+    if(Array.isArray(envelope.approvedLeaveImported)) State.approvedLeaveImported = envelope.approvedLeaveImported;
+    if(envelope.overrides && typeof envelope.overrides === 'object'){
+      State.overrides = Object.assign({}, State.overrides||{}, envelope.overrides);
+    }
+  }
+
   sanitizeDataset();
   ensureLeaveTable();
   State.settings.lastSyncedAt = new Date().toISOString();
   State.settings.lastSyncError = '';
+  State.settings.dataSource = 'published';
+  State.settings.publishedAt = (newData.meta && newData.meta.published_at) || State.settings.lastSyncedAt;
   await persist();
   return newData;
 }
@@ -724,24 +771,37 @@ async function bootstrap(){
   }
   ensureLeaveTable();
   sanitizeDataset();
-  // Has the user imported their own dataset on this device?  We use this to avoid
-  // overwriting freshly-imported local data with an older bundled roster-data.json.
-  const hasUserData = !!(persisted && persisted.data &&
-    persisted.data.meta && persisted.data.meta.source_file);
-  // Auto-fetch published JSON on open when URL is configured.
-  // Fallback: if no remote dataUrl is set and there is no user-imported local data,
-  // try a same-folder roster-data.json so a GitHub Pages deployment can ship its live
-  // roster as a separate file (embedded <script id="seed-data"> is only a last resort).
+  // Initial data-source guess from what's persisted (the published-JSON
+  // fetch below will refine this).
+  if(!State.settings.dataSource){
+    State.settings.dataSource = (persisted && persisted.data && persisted.data.meta && persisted.data.meta.source_file)
+      ? 'local' : 'seed';
+  }
+  // Always attempt to fetch the published roster-data.json on startup
+  // (skipped on file://, where fetch is blocked). The newer-wins guard
+  // inside fetchFromDataUrl protects unpublished local edits from being
+  // overwritten by an older published file.
+  const tryPublishedFetch = location.protocol !== 'file:';
   if(State.settings.dataUrl && State.settings.dataUrlAutoFetch !== false){
     fetchFromDataUrl(State.settings.dataUrl)
       .then(()=>{ toast('Data refreshed from published source','ok'); setSubtitle(); routeFromHash(); })
-      .catch(e=>{ console.warn('Auto-fetch failed:',e); });
-  } else if(!hasUserData && location.protocol !== 'file:'){
-    // Quietly try a local roster-data.json next to index.html — skip when running off file://
-    // because browsers block fetch() for local files (and the embedded seed is fine there).
+      .catch(e=>{
+        if(e && e.code === 'LOCAL_NEWER'){
+          toast('Local data is newer than the published JSON — kept local copy.','warn');
+        } else {
+          console.warn('Auto-fetch failed:',e);
+        }
+      });
+  } else if(tryPublishedFetch){
     fetchFromDataUrl('roster-data.json')
       .then(()=>{ console.info('bootstrap: loaded roster-data.json'); setSubtitle(); routeFromHash(); })
-      .catch(e=>{ console.info('bootstrap: no roster-data.json — using cached/seed data:', e.message||e); });
+      .catch(e=>{
+        if(e && e.code === 'LOCAL_NEWER'){
+          toast('Local data is newer than the published roster-data.json — kept local copy.','warn');
+        } else {
+          console.info('bootstrap: no roster-data.json — using cached/seed data:', e.message||e);
+        }
+      });
   }
   // Always land on the welcome screen on every fresh page load,
   // regardless of what hash the URL contains from a previous session.
@@ -1053,13 +1113,21 @@ function renderWelcome(){
 // Used on the welcome screen and inside Coordinator → Import.
 function buildVersionFooter(){
   const meta = (State.data && State.data.meta) || {};
-  const dataVersion = meta.parsed_at || meta.published_at || meta.generated_at || '(embedded seed)';
-  const lastSynced = State.settings && State.settings.lastSyncedAt
-    ? new Date(State.settings.lastSyncedAt).toLocaleString() + ' (' + fmtRelativeTime(State.settings.lastSyncedAt) + ')'
+  const dataVersion = meta.published_at || meta.parsed_at || meta.generated_at || '(embedded seed)';
+  const fmtTs = ts => ts
+    ? new Date(ts).toLocaleString() + ' (' + fmtRelativeTime(ts) + ')'
     : 'never';
+  const src = (State.settings && State.settings.dataSource) || 'seed';
+  const SRC_LABEL = {
+    published:    {text:'Published JSON (shared on GitHub Pages)', kind:'green'},
+    local:        {text:'Local Excel upload only (this device)',   kind:'yellow'},
+    'json-backup':{text:'Local JSON backup (this device)',         kind:'yellow'},
+    seed:         {text:'Embedded seed fallback',                  kind:'gray'},
+  };
+  const srcInfo = SRC_LABEL[src] || SRC_LABEL.seed;
   const box = el('div',{class:'muted', style:{
     margin:'1rem auto 0',padding:'.55rem .8rem',fontSize:'.72rem',
-    textAlign:'center',maxWidth:'520px',lineHeight:'1.5',
+    textAlign:'center',maxWidth:'560px',lineHeight:'1.55',
     border:'1px dashed var(--border)', borderRadius:'8px',
     background:'var(--surface-2)'
   }});
@@ -1073,9 +1141,26 @@ function buildVersionFooter(){
     el('span',null, String(dataVersion))
   ));
   box.appendChild(el('div',null,
-    el('strong',null,'Last synced: '),
-    el('span',null, lastSynced)
+    el('strong',null,'Data source: '),
+    el('span',{class:'badge '+srcInfo.kind, style:{verticalAlign:'baseline'}}, srcInfo.text)
   ));
+  box.appendChild(el('div',null,
+    el('strong',null,'Last imported: '),
+    el('span',null, fmtTs(State.settings && State.settings.lastImportedAt))
+  ));
+  box.appendChild(el('div',null,
+    el('strong',null,'Last synced: '),
+    el('span',null, fmtTs(State.settings && State.settings.lastSyncedAt))
+  ));
+  // Local-only banner — surface the publish reminder anywhere the footer renders.
+  if(src === 'local' || src === 'json-backup'){
+    const warn = el('div',{class:'note warn',style:{marginTop:'.4rem',textAlign:'left'}});
+    warn.appendChild(el('strong',null,'You are viewing local-only data from this device. '));
+    warn.appendChild(el('span',null,'Phones and other devices will keep showing the old data until you '));
+    warn.appendChild(el('strong',null,'download roster-data.json and publish it to GitHub'));
+    warn.appendChild(el('span',null,' (Coordinator → Import).'));
+    box.appendChild(warn);
+  }
   return box;
 }
 function roleCard(emoji, label, desc, onclick){
@@ -1659,6 +1744,422 @@ function _mergeAndPersistLogRecords(state_key, newRecs){
   newRecs.forEach(r => { if(r && r.id) byId[r.id] = r; });
   State[state_key] = legacy.concat(Object.values(byId));
   return persist();
+}
+
+/* ============================================================
+   MULTI-EXCEL IMPORT + SHARED PUBLISH WORKFLOW
+   ------------------------------------------------------------
+   Five Excel sources feed the dataset:
+     - two roster/schedule workbooks
+     - one leave/LOA workbook
+     - one irregularity log workbook
+     - one commendation log workbook
+   These helpers detect each file's type, route it to the right
+   parser, merge results into State (without erasing other slices),
+   and let the coordinator download a single roster-data.json that
+   can be committed to GitHub Pages so phones see the same data.
+   ============================================================ */
+
+// "Freshness" timestamp on a roster dataset — picks the most reliable
+// indicator of when this data was last produced.
+function dataFreshness(d){
+  const m = (d && d.meta) || {};
+  return m.published_at || m.parsed_at || m.generated_at || '';
+}
+
+function _flattenSheetText(wb, limit){
+  const sheets = wb && wb.SheetNames ? wb.SheetNames : [];
+  const out = [];
+  for(const sn of sheets){
+    out.push(sn.toLowerCase());
+    const ws = wb.Sheets[sn]; if(!ws || !ws['!ref']) continue;
+    const rows = sheetToRows(ws);
+    for(let i = 0; i < Math.min(limit||25, rows.length); i++){
+      const r = rows[i] || [];
+      for(const cell of r){
+        if(cell == null) continue;
+        out.push(String(cell).toLowerCase());
+      }
+    }
+  }
+  return out.join(' || ');
+}
+
+// Returns one of: 'roster_schedule' | 'leave_loa' |
+//                 'irregularity_log' | 'commendation_log' | 'unknown'
+function detectWorkbookType(wb, fileName){
+  const fname = (fileName||'').toLowerCase();
+  // ── 1. Irregularity / Commendation: reuse the wide-log detector first
+  //     because filenames sometimes say "log" generically.
+  const wideHit = _detectWideLogType(wb);
+  if(wideHit === 'commendation_log' || wideHit === 'irregularity_log') return wideHit;
+
+  // ── 2. Filename heuristics — strongest signal when the file is named cleanly.
+  if(/irregular|incident/.test(fname)) return 'irregularity_log';
+  if(/commend|praise|recogn/.test(fname)) return 'commendation_log';
+  if(/(?:^|[\W_])loa(?:$|[\W_])|leave\b|absence|time.?off/.test(fname)) return 'leave_loa';
+  if(/master|roster|schedule|timetable|year ?2|spring|fall|term/.test(fname)) return 'roster_schedule';
+
+  // ── 3. Sheet-content heuristics — inspect first ~20 rows of every sheet.
+  const blob = _flattenSheetText(wb, 25);
+
+  // Leave/LOA: requires both an instructor/email column and date-range columns.
+  const hasInstructorCol = /\b(?:instructor|faculty|full\s*name)\b/.test(blob)
+                       || /\b(?:sgu\s*email|email\s*address|\bemail\b)/.test(blob);
+  const hasDateRange = (/\bstart\s*date\b/.test(blob) && /\bend\s*date\b/.test(blob))
+                    || (/\bfrom\b/.test(blob) && /\bto\b/.test(blob) && /\bleave\b/.test(blob));
+  const hasLeaveWords = /\bleave\b|\bloa\b|\babsence\b|\bvacation\b|\bsick\b|\bbereavement\b/.test(blob);
+  if((hasInstructorCol && hasDateRange) || (hasInstructorCol && hasLeaveWords && /\bdate\b/.test(blob))){
+    return 'leave_loa';
+  }
+
+  // Roster workbook signature: instructor name list + a schedule-ish sheet name
+  // (April / May / Jan / Calendar / Master / Timetable / BPM / PCM).
+  const rosterSheets = (wb.SheetNames||[]).map(s => s.toLowerCase());
+  const looksRoster = rosterSheets.some(s =>
+    /^(?:jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(t)?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)\b/.test(s)
+    || /\b(?:calendar|calender|timetable|master|schedule|bpm|pcm|review)\b/.test(s)
+    || /clinical\s*instructor/.test(s));
+  if(looksRoster) return 'roster_schedule';
+  return 'unknown';
+}
+
+// ----------------------------------------------------------------
+// Leave/LOA parser used by the multi-file import coordinator.
+// Returns {records, summary}.  Records carry stable fingerprint IDs so
+// re-importing the same workbook does not produce duplicates.
+// ----------------------------------------------------------------
+function parseLeaveWorkbookForExport(wb, filename){
+  const records = [];
+  const skipReasons = {};
+  let scannedSheets = 0, headerlessSheets = 0;
+  let unmatched = 0, matched = 0;
+  const unmatchedRows = [];
+  const bumpSkip = (k) => { skipReasons[k] = (skipReasons[k]||0)+1; };
+
+  for(const sn of (wb.SheetNames||[])){
+    scannedSheets++;
+    const ws = wb.Sheets[sn]; if(!ws || !ws['!ref']){ bumpSkip(sn+' — empty'); continue; }
+    const rows = sheetToRows(ws);
+    if(!rows || rows.length < 2){ bumpSkip(sn+' — no data rows'); continue; }
+    // Find header row in first 10 rows: needs an instructor/email column AND any date column.
+    let headerIdx = -1; let header = null;
+    for(let i = 0; i < Math.min(10, rows.length); i++){
+      const lower = (rows[i]||[]).map(c => vstr(c).toLowerCase());
+      const hasName = lower.some(c => /(instructor|faculty|full\s*name|^name$)/.test(c));
+      const hasEmail = lower.some(c => /email/.test(c));
+      const hasDate = lower.some(c => /(date|from|to|start|end)/.test(c));
+      if((hasName || hasEmail) && hasDate){ headerIdx = i; header = lower; break; }
+    }
+    if(headerIdx < 0){ headerlessSheets++; bumpSkip(sn+' — no header row'); continue; }
+    const find = (preds) => header.findIndex(c => preds.some(p => p.test(c)));
+    const cName   = find([/^(?:instructor|faculty|full\s*name|name)$/, /instructor\s*name/, /faculty\s*name/, /full\s*name/]);
+    const cEmail  = find([/sgu\s*email/, /email\s*address/, /^email/]);
+    const cType   = find([/leave\s*type/, /type/, /category/]);
+    const cReason = find([/reason/, /^note/, /comment/, /detail/]);
+    const cStatus = find([/^status/, /approval/]);
+    const cStart  = find([/start\s*date/, /^from$/, /^begin/]);
+    const cEnd    = find([/end\s*date/, /^to$/, /^until/, /^thru/]);
+    const cDate   = find([/^date$/, /absent\s*date/, /leave\s*date/]);
+    const isLong  = cStart >= 0 && cEnd >= 0;
+    const isDaily = !isLong && cDate >= 0;
+    if(!isLong && !isDaily){ bumpSkip(sn+' — header found but no recognized date columns'); continue; }
+
+    function pushRange(name, email, startISO, endISO, type, reason, status){
+      const inst = (email && findInstructor(email)) || (name && findInstructor(name)) || null;
+      const instructor_id = inst ? inst.instructor_id : '';
+      if(inst) matched++; else { unmatched++; unmatchedRows.push({name, email, start_date:startISO, end_date:endISO, source_sheet:sn, source_file:filename}); }
+      const fp = newId('lv', instructor_id || ('u:' + (email||name||'')).toLowerCase(),
+                        startISO, endISO, (type||'').toLowerCase());
+      records.push({
+        request_id: fp,
+        instructor_id,
+        instructor_name: name || (inst ? inst.full_name : ''),
+        instructor_email: email || (inst ? inst.email : ''),
+        leave_type: type || 'Other',
+        start_date: startISO,
+        end_date: endISO,
+        reason: reason || '',
+        status: (status || 'approved').toLowerCase(),
+        submitted_at: new Date().toISOString(),
+        decided_at: new Date().toISOString(),
+        decided_by: 'imported',
+        source: 'imported:'+filename,
+        source_sheet: sn,
+        matched: !!inst,
+      });
+    }
+
+    if(isLong){
+      for(let r = headerIdx + 1; r < rows.length; r++){
+        const row = rows[r]||[];
+        const name = cName>=0 ? vstr(row[cName]) : '';
+        const email = cEmail>=0 ? vstr(row[cEmail]) : '';
+        if(!name && !email) continue;
+        const sd = vdate(row[cStart]); const ed = vdate(row[cEnd]);
+        if(!sd || !ed || !/^\d{4}-\d{2}-\d{2}/.test(sd) || !/^\d{4}-\d{2}-\d{2}/.test(ed)){
+          bumpSkip(sn+' — row '+(r+1)+' missing start/end date');
+          continue;
+        }
+        pushRange(name, email, sd, ed,
+          cType>=0?vstr(row[cType]):'',
+          cReason>=0?vstr(row[cReason]):'',
+          cStatus>=0?vstr(row[cStatus]):'');
+      }
+    } else {
+      // Daily: group consecutive same-instructor/same-type dates into ranges.
+      const events = [];
+      for(let r = headerIdx + 1; r < rows.length; r++){
+        const row = rows[r]||[];
+        const name = cName>=0 ? vstr(row[cName]) : '';
+        const email = cEmail>=0 ? vstr(row[cEmail]) : '';
+        const date = vdate(row[cDate]);
+        if((!name && !email) || !date || !/^\d{4}-\d{2}-\d{2}/.test(date)) continue;
+        events.push({
+          key: (email||name).toLowerCase(),
+          name, email, date,
+          type: cType>=0?vstr(row[cType]):'',
+          reason: cReason>=0?vstr(row[cReason]):'',
+          status: cStatus>=0?vstr(row[cStatus]):'',
+        });
+      }
+      events.sort((a,b)=>a.key.localeCompare(b.key) || a.type.localeCompare(b.type) || a.date.localeCompare(b.date));
+      let cur = null;
+      function flush(){
+        if(!cur) return;
+        pushRange(cur.name, cur.email, cur.start, cur.end, cur.type, cur.reason, cur.status);
+        cur = null;
+      }
+      for(const e of events){
+        if(cur && cur.key===e.key && cur.type===e.type){
+          const next = new Date(cur.end+'T00:00:00'); next.setDate(next.getDate()+1);
+          if(next.toISOString().slice(0,10) === e.date){ cur.end = e.date; continue; }
+        }
+        flush();
+        cur = { key:e.key, name:e.name, email:e.email, type:e.type, start:e.date, end:e.date, reason:e.reason, status:e.status };
+      }
+      flush();
+    }
+  }
+  return { records, summary: { scannedSheets, headerlessSheets, matched, unmatched, skipReasons, unmatchedRows }};
+}
+
+// Dedup leave records by request_id (stable fingerprint). Existing user-entered
+// requests (status:pending without a 'source' prefix of "imported:") survive.
+function mergeLeaveRequests(target, incoming){
+  const out = (target||[]).slice();
+  const byId = {};
+  out.forEach(r => { if(r && r.request_id) byId[r.request_id] = r; });
+  for(const r of (incoming||[])){
+    if(!r || !r.request_id) continue;
+    byId[r.request_id] = Object.assign({}, byId[r.request_id]||{}, r);
+  }
+  // Rebuild keeping original order for stable display.
+  const seen = new Set();
+  const merged = [];
+  for(const r of out){ if(r && r.request_id && byId[r.request_id]){ merged.push(byId[r.request_id]); seen.add(r.request_id); } }
+  for(const id of Object.keys(byId)){ if(!seen.has(id)) merged.push(byId[id]); }
+  return merged;
+}
+
+// Merge wide-log records (irregularity OR commendation) into a target array,
+// deduping by stable .id fingerprint. Legacy (no-id) records are preserved.
+function mergeWideLogRecords(target, incoming){
+  const out = (target||[]).slice();
+  const byId = {};
+  out.forEach(r => { if(r && r.id) byId[r.id] = r; });
+  const legacy = out.filter(r => !r || !r.id);
+  (incoming||[]).forEach(r => { if(r && r.id) byId[r.id] = r; });
+  return legacy.concat(Object.values(byId));
+}
+
+// Central multi-file Excel import coordinator.
+// Detects each file's type, routes it to its parser, merges into State,
+// preserves data slices from other workbook types, and returns a summary
+// suitable for rendering in the UI.
+async function importMultipleExcelFiles(files, opts){
+  opts = opts || {};
+  const onProgress = opts.onProgress || (()=>{});
+  await ensureSheetJs();
+
+  // Per-file detail rows for the combined summary.
+  const fileSummaries = [];
+
+  // Start from the live State so other slices (leave, loa, irreg, commend)
+  // are preserved when only a subset of file types is uploaded this time.
+  let nextRoster = State.data ? Object.assign({}, State.data) : emptyDataset();
+  let nextLoa = (State.loaData||[]).slice();
+  let nextIrreg = (State.irregularityData||[]).slice();
+  let nextCommend = (State.commendationData||[]).slice();
+  let nextApprovedLeave = (State.approvedLeaveImported||[]).slice();
+  let leaveRequests = (nextRoster.leave_requests||[]).slice();
+
+  const allSourceFiles = new Set(((nextRoster.meta&&nextRoster.meta.source_files)||[]));
+
+  for(let i = 0; i < files.length; i++){
+    const file = files[i];
+    onProgress({stage:'reading', index:i, total:files.length, file:file.name});
+    let buf;
+    try{ buf = await file.arrayBuffer(); }
+    catch(e){
+      fileSummaries.push({name:file.name, type:'unknown', error:'Could not read file: '+(e.message||e), records:0});
+      continue;
+    }
+    let wb;
+    try{ wb = XLSX.read(buf, {cellDates:true}); }
+    catch(e){
+      fileSummaries.push({name:file.name, type:'unknown', error:'Could not parse workbook: '+(e.message||e), records:0});
+      continue;
+    }
+    const type = detectWorkbookType(wb, file.name);
+    onProgress({stage:'parsing', index:i, total:files.length, file:file.name, type});
+
+    if(type === 'roster_schedule'){
+      let parsed; try{ parsed = parseWorkbook(wb); }
+      catch(e){ fileSummaries.push({name:file.name, type, error:'Roster parser failed: '+(e.message||e), records:0}); continue; }
+      // Don't let mergeDatasets overwrite the running leave_requests with an old copy.
+      parsed.leave_requests = leaveRequests;
+      nextRoster = mergeDatasets(nextRoster, parsed);
+      leaveRequests = nextRoster.leave_requests || leaveRequests;
+      allSourceFiles.add(file.name);
+      fileSummaries.push({
+        name:file.name, type,
+        records: (parsed.assignments||[]).length,
+        instructors: (parsed.instructors||[]).length,
+        activities: (parsed.master_schedule||[]).length,
+        reviews: (parsed.review_sessions||[]).length,
+        skipped: 0, unmatched: 0,
+      });
+    } else if(type === 'leave_loa'){
+      let parsed; try{ parsed = parseLeaveWorkbookForExport(wb, file.name); }
+      catch(e){ fileSummaries.push({name:file.name, type, error:'Leave parser failed: '+(e.message||e), records:0}); continue; }
+      leaveRequests = mergeLeaveRequests(leaveRequests, parsed.records);
+      // Mirror imported leave entries into the legacy "approvedLeaveImported"
+      // list so the existing Approved-Leave panel stays correct.
+      const approvedMirror = parsed.records
+        .filter(r => (r.status||'').toLowerCase() === 'approved')
+        .map(r => ({
+          name: r.instructor_name, email: r.instructor_email,
+          start: r.start_date, end: r.end_date,
+          type: r.leave_type, reason: r.reason,
+          source_file: file.name, source_sheet: r.source_sheet,
+        }));
+      // Append + dedup by (email|name|start|end)
+      const seenA = new Set(nextApprovedLeave.map(x => ((x.email||x.name||'')+'|'+x.start+'|'+x.end).toLowerCase()));
+      for(const a of approvedMirror){
+        const k = ((a.email||a.name||'')+'|'+a.start+'|'+a.end).toLowerCase();
+        if(!seenA.has(k)){ seenA.add(k); nextApprovedLeave.push(a); }
+      }
+      allSourceFiles.add(file.name);
+      const skipCount = Object.values(parsed.summary.skipReasons||{}).reduce((a,b)=>a+b,0);
+      fileSummaries.push({
+        name:file.name, type,
+        records: parsed.records.length,
+        matched: parsed.summary.matched,
+        unmatched: parsed.summary.unmatched,
+        skipped: skipCount,
+      });
+    } else if(type === 'irregularity_log' || type === 'commendation_log'){
+      let parsed; try{ parsed = parseMonthlyWideLogWorkbook(wb, type, file.name); }
+      catch(e){ fileSummaries.push({name:file.name, type, error:'Log parser failed: '+(e.message||e), records:0}); continue; }
+      if(type === 'irregularity_log'){
+        nextIrreg = mergeWideLogRecords(nextIrreg, parsed.records);
+      } else {
+        nextCommend = mergeWideLogRecords(nextCommend, parsed.records);
+      }
+      allSourceFiles.add(file.name);
+      fileSummaries.push({
+        name:file.name, type,
+        records: parsed.records.length,
+        matched: parsed.summary.matched,
+        unmatched: parsed.summary.unmatched,
+        skipped: parsed.summary.skipped,
+        sheets: parsed.summary.monthlySheetsScanned,
+      });
+    } else {
+      fileSummaries.push({name:file.name, type:'unknown', records:0,
+        error:'Could not detect workbook type — file not imported. Rename the file (e.g. include "roster", "leave", "irregularity" or "commendation") or upload via the per-type panels below.'});
+    }
+  }
+
+  // Commit: update State, refresh meta, persist.
+  nextRoster.leave_requests = leaveRequests;
+  if(!nextRoster.leave_requests) nextRoster.leave_requests = [];
+  nextRoster.meta = Object.assign({}, nextRoster.meta||{}, {
+    source_files: Array.from(allSourceFiles),
+    source_file: Array.from(allSourceFiles).join(', '),
+    parsed_at: new Date().toISOString(),
+    parser_version: 3,
+  });
+  // Recompute schedule_months from assignments + sheets_seen.
+  const derivedMonths = _sheetMonthsFromMeta(nextRoster.meta, nextRoster.assignments);
+  if(derivedMonths.length) nextRoster.meta.schedule_months = derivedMonths;
+
+  State.data = nextRoster;
+  State.loaData = nextLoa;                     // unchanged in this flow (LOA is its own UI today)
+  State.irregularityData = nextIrreg;
+  State.commendationData = nextCommend;
+  State.approvedLeaveImported = nextApprovedLeave;
+  sanitizeDataset(); ensureLeaveTable();
+  State.overrides = State.overrides || {};
+  State.settings.lastImportedAt = new Date().toISOString();
+  State.settings.lastSyncedAt = State.settings.lastImportedAt;
+  State.settings.lastSyncError = '';
+  State.settings.dataSource = 'local';
+  await persist();
+
+  // Build aggregate counts for the combined import summary card.
+  const monthCounts = {};
+  (State.data.assignments||[]).forEach(a => { if(a.date){ const m = a.date.slice(0,7); monthCounts[m] = (monthCounts[m]||0)+1; }});
+  return {
+    fileSummaries,
+    totals: {
+      filesSelected: files.length,
+      instructors: (State.data.instructors||[]).length,
+      activities: (State.data.master_schedule||[]).length,
+      assignments: (State.data.assignments||[]).length,
+      reviews: (State.data.review_sessions||[]).length,
+      leave: (State.data.leave_requests||[]).length,
+      irregularity: (State.irregularityData||[]).length,
+      commendation: (State.commendationData||[]).length,
+      months: Object.keys(monthCounts).sort(),
+    },
+    parsed_at: State.data.meta.parsed_at,
+  };
+}
+
+// Assemble the shared roster-data.json bundle: full dataset + every
+// per-tab slice, with version + freshness metadata. This is the file
+// the coordinator commits to GitHub alongside index.html so every
+// device can load the same data.
+function buildExportedRosterDataPayload(){
+  const now = new Date().toISOString();
+  const data = State.data || emptyDataset();
+  const meta = Object.assign({}, data.meta || {}, {
+    app_version: APP_VERSION,
+    published_at: now,
+    parsed_at: (data.meta && data.meta.parsed_at) || now,
+    parser_version: 3,
+  });
+  return {
+    __format: 'sgu-roster-data',
+    __version: 2,
+    app_version: APP_VERSION,
+    generated_at: now,
+    data: Object.assign({}, data, { meta }),
+    overrides: State.overrides || {},
+    loaData: State.loaData || [],
+    irregularityData: State.irregularityData || [],
+    commendationData: State.commendationData || [],
+    approvedLeaveImported: State.approvedLeaveImported || [],
+  };
+}
+
+function downloadRosterJson(){
+  const payload = buildExportedRosterDataPayload();
+  const json = JSON.stringify(payload, null, 1);
+  downloadFile('roster-data.json', json, 'application/json');
+  toast('roster-data.json downloaded — commit it to GitHub to publish', 'ok');
 }
 
 function reviewItem(r){
@@ -3717,90 +4218,124 @@ function adminImport(main){
   urlCard.appendChild(urlBtns);
   masterPanel.appendChild(urlCard);
 
-  /* ─── 2. Upload Excel workbook(s) manually ───────────────────── */
+  /* ─── 2. Multi-Excel upload (auto-detected) ───────────────────── */
   const xlsCard = el('div',{class:'card'});
-  xlsCard.appendChild(el('h2',null,'Upload Excel workbook(s)'));
+  xlsCard.appendChild(el('h2',null,'Upload Excel workbooks (auto-detected)'));
   xlsCard.appendChild(el('div',{class:'note'},
-    'Upload one or more .xlsx workbooks at the same time. Each is parsed in the browser and merged into a single dataset — nothing is sent to a server. Leave requests on this device are preserved.'));
+    'Drop in any combination of the five Excel sources — two roster/schedule files, ' +
+    'one LOA/leave file, the irregularity log, and the commendation log. ' +
+    'Each file is auto-detected and routed to the right parser. ' +
+    'Uploading one type never erases the others.'));
+  xlsCard.appendChild(el('div',{class:'note',style:{marginTop:'.3rem'}},
+    'Tip: keep the standard filenames (e.g. "Year2 Master sheet", ' +
+    '"CT LOA", "Spring 26 Year 2 Irregularity Log", "Spring 26 Year 2 Commendation Log") ' +
+    'so detection is unambiguous.'));
   const fileInput = el('input',{type:'file',accept:'.xlsx,.xls',multiple:true});
   const uploadStatus = el('div',{class:'muted',style:{marginTop:'.5rem',fontSize:'.88rem'}});
   xlsCard.appendChild(fileInput);
   xlsCard.appendChild(uploadStatus);
-  const xlsPreview = el('div',{style:{marginTop:'.8rem'}});
-  xlsCard.appendChild(xlsPreview);
+  const xlsSummary = el('div',{style:{marginTop:'.8rem'}});
+  xlsCard.appendChild(xlsSummary);
+  const xlsActions = el('div',{class:'cluster',style:{marginTop:'.6rem'}});
+  xlsCard.appendChild(xlsActions);
+
+  function _typeLabel(t){
+    return ({
+      roster_schedule:    'Roster / Schedule',
+      leave_loa:          'Leave / LOA',
+      irregularity_log:   'Irregularity Log',
+      commendation_log:   'Commendation Log',
+      unknown:            'Unknown / unsupported',
+    })[t] || t;
+  }
+
   fileInput.addEventListener('change', async (e)=>{
     const files = Array.from((e.target && e.target.files) || []);
     if(!files.length) return;
+    clear(xlsSummary); clear(xlsActions);
     uploadStatus.textContent = 'Loading Excel parser…';
     try{
-      await ensureSheetJs();
-      let merged = null;
-      const fileNames = [];
-      for(const file of files){
-        uploadStatus.textContent = 'Parsing '+file.name+'… ('+(fileNames.length+1)+'/'+files.length+')';
-        const buf = await file.arrayBuffer();
-        const wb = XLSX.read(buf, {cellDates:true});
-        const parsed = parseWorkbook(wb);
-        fileNames.push(file.name);
-        merged = merged ? mergeDatasets(merged, parsed) : parsed;
-      }
-      // Preserve any existing user-entered data (leave requests).
-      const existingLeave = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
-      merged.leave_requests = existingLeave;
-      merged.meta = Object.assign({}, merged.meta||{}, {
-        source_file: fileNames.join(', '),
-        source_files: fileNames,
-        parsed_at: new Date().toISOString(),
-        parser_version: 3,
+      const result = await importMultipleExcelFiles(files, {
+        onProgress: ({stage, index, total, file, type}) => {
+          uploadStatus.textContent = stage==='parsing'
+            ? 'Parsing '+(file||'')+' ('+(index+1)+'/'+total+') — detected '+(_typeLabel(type||'unknown'))+'…'
+            : 'Reading '+(file||'')+' ('+(index+1)+'/'+total+')…';
+        }
       });
-      // Rebuild schedule_months from the merged sheets_seen so allowed-month filtering covers every workbook.
-      const derivedMonths = _sheetMonthsFromMeta(merged.meta, merged.assignments);
-      if(derivedMonths.length) merged.meta.schedule_months = derivedMonths;
-      State.data = merged;
-      sanitizeDataset(); ensureLeaveTable();
-      State.overrides = {};
-      State.settings.lastSyncedAt = new Date().toISOString();
-      State.settings.lastSyncError = '';
-      await persist();
-      // Build a per-month breakdown so we can confirm e.g. January data really survived.
-      const monthCounts = {};
-      (State.data.assignments||[]).forEach(a => {
-        if(a.date){ const m = a.date.slice(0,7); monthCounts[m] = (monthCounts[m]||0)+1; }
-      });
-      const monthsDetected = Object.keys(monthCounts).sort();
-      const monthsList = monthsDetected.length
-        ? monthsDetected.map(m => monthLabel(m)+' ('+monthCounts[m]+' assignments)').join(', ')
-        : '(none)';
-      const summary = 'Imported '+files.length+' file'+(files.length!==1?'s':'')+' ('+fileNames.join(', ')+'): '+
-        State.data.instructors.length+' instructors · '+
-        State.data.master_schedule.length+' activities · '+
-        State.data.assignments.length+' assignments · '+
-        State.data.review_sessions.length+' review sessions.';
-      // SG / Small-Group counts — useful for confirming the broadened SG detector picked them all up.
-      const sgActivities = (State.data.master_schedule||[]).filter(isSGActivity);
-      const sgActIds = new Set(sgActivities.map(a => a.activity_id));
-      const sgAssignments = (State.data.assignments||[]).filter(a => sgActIds.has(a.activity_id));
-      const sgInstructorIds = new Set(sgAssignments.map(a => a.instructor_id).filter(Boolean));
-      const sgActivitiesWithNoInstructor = sgActivities.filter(a =>
-        !sgAssignments.some(asgn => asgn.activity_id === a.activity_id));
       clear(uploadStatus);
-      uploadStatus.appendChild(el('div',null, summary));
-      uploadStatus.appendChild(el('div',{style:{marginTop:'.3rem'}}, 'Months detected: '+monthsList+'.'));
-      uploadStatus.appendChild(el('div',{style:{marginTop:'.3rem'}},
-        'Small Group activities found: '+sgActivities.length+
-        ' · assigned instructors (unique): '+sgInstructorIds.size+
-        ' · SG activities with no assigned instructor: '+sgActivitiesWithNoInstructor.length+'.'));
-      toast('Imported '+files.length+' workbook'+(files.length!==1?'s':'')+' — refreshing','ok');
-      clear(xlsPreview);
-      xlsPreview.appendChild(el('div',{class:'kpi-grid'},
-        kpi(State.data.instructors.length,'Instructors'),
-        kpi(State.data.master_schedule.length,'Activities'),
-        kpi(State.data.assignments.length,'Assignments'),
-        kpi(State.data.review_sessions.length,'Reviews')
+
+      // ── Combined import summary ─────────────────────────────
+      const card = el('div',{class:'card',style:{marginTop:'0',padding:'.8rem'}});
+      card.appendChild(el('h3',null,'Combined import summary'));
+      card.appendChild(el('div',{class:'kpi-grid'},
+        kpi(result.totals.filesSelected,'Files'),
+        kpi(result.totals.instructors,'Instructors'),
+        kpi(result.totals.activities,'Activities'),
+        kpi(result.totals.assignments,'Assignments'),
+        kpi(result.totals.leave,'Leave records'),
+        kpi(result.totals.irregularity,'Irregularities'),
+        kpi(result.totals.commendation,'Commendations'),
+        kpi(result.totals.reviews,'Review sessions'),
       ));
+
+      // Per-file detail table.
+      const tbl = el('table',{class:'tbl',style:{marginTop:'.6rem',fontSize:'.85rem'}});
+      tbl.appendChild(el('thead',{},el('tr',{},
+        el('th',{},'File'), el('th',{},'Detected type'), el('th',{},'Records'),
+        el('th',{},'Matched'), el('th',{},'Unmatched'), el('th',{},'Skipped')
+      )));
+      const tb = el('tbody',{});
+      for(const f of result.fileSummaries){
+        tb.appendChild(el('tr',{},
+          el('td',{}, f.name),
+          el('td',{}, _typeLabel(f.type)),
+          el('td',{}, String(f.records||0)),
+          el('td',{}, f.matched != null ? String(f.matched) : '—'),
+          el('td',{}, f.unmatched != null ? String(f.unmatched) : '—'),
+          el('td',{}, f.skipped != null ? String(f.skipped) : '—'),
+        ));
+        if(f.error){
+          tb.appendChild(el('tr',{},
+            el('td',{colspan:'6',class:'muted',style:{color:'var(--red)',fontSize:'.78rem'}}, f.error)
+          ));
+        }
+      }
+      tbl.appendChild(tb);
+      card.appendChild(el('div',{class:'tbl-wrap'}, tbl));
+
+      // Months + data version.
+      const monthsList = result.totals.months.length
+        ? result.totals.months.map(m => monthLabel(m)).join(', ')
+        : '(none)';
+      card.appendChild(el('div',{class:'muted',style:{marginTop:'.5rem',fontSize:'.85rem'}},
+        el('div',null, el('strong',null,'Months detected: '), monthsList),
+        el('div',null, el('strong',null,'Data version: '), result.parsed_at),
+        el('div',null, el('strong',null,'Data source: '), 'Local Excel upload only (this device).'),
+      ));
+
+      // ── Local-only warning + publish CTA ─────────────────────
+      const warn = el('div',{class:'note warn',style:{marginTop:'.6rem'}});
+      warn.appendChild(el('strong',null,'Excel files have been imported on this device only. '));
+      warn.appendChild(el('span',null,'To make this updated data visible on phones and other devices, '));
+      warn.appendChild(el('strong',null,'download the updated roster-data.json'));
+      warn.appendChild(el('span',null,' below and publish it to GitHub (commit it alongside index.html).'));
+      card.appendChild(warn);
+
+      xlsSummary.appendChild(card);
+
+      // ── Publish actions ──────────────────────────────────────
+      xlsActions.appendChild(el('button',{class:'btn gold',onclick:downloadRosterJson},
+        '⬇ Download updated roster-data.json'));
+      xlsActions.appendChild(el('button',{class:'btn secondary',onclick:()=>location.reload()},
+        '↻ Reload app with merged data'));
+
+      toast('Imported '+files.length+' workbook'+(files.length!==1?'s':''),'ok');
       fileInput.value = '';
-      setTimeout(()=>location.reload(), 900);
-    }catch(err){ uploadStatus.textContent='Import failed: '+(err.message||err); toast('Import failed','err'); }
+    }catch(err){
+      console.error(err);
+      uploadStatus.textContent='Import failed: '+(err.message||err);
+      toast('Import failed','err');
+    }
   });
   masterPanel.appendChild(xlsCard);
 
@@ -3818,19 +4353,31 @@ function adminImport(main){
     jsonStatus.textContent = 'Reading…';
     try{
       const text = await file.text();
-      const parsed = JSON.parse(text);
-      const newData = (parsed.data && parsed.data.instructors) ? parsed.data : parsed;
-      if(!newData.instructors || !Array.isArray(newData.instructors))
+      const envelope = JSON.parse(text);
+      const isFullBundle = envelope && envelope.__format === 'sgu-roster-data' && envelope.data;
+      const newData = isFullBundle ? envelope.data
+        : (envelope.data && envelope.data.instructors) ? envelope.data : envelope;
+      if(!newData || !newData.instructors || !Array.isArray(newData.instructors))
         throw new Error('Not a valid roster JSON (no instructors array).');
-      const existingLeave = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
-      newData.leave_requests = existingLeave;
+      // Preserve any pending (user-entered, not imported) leave on this device.
+      const existing = (State.data && State.data.leave_requests) ? State.data.leave_requests.slice() : [];
+      const pendingLocal = existing.filter(r => !(r.source && String(r.source).startsWith('imported:')));
+      newData.leave_requests = mergeLeaveRequests(pendingLocal, newData.leave_requests || []);
       normalizeImportedJson(newData);
       State.data = newData;
-      if(parsed.settings) Object.assign(State.settings, parsed.settings, {passcode:State.settings.passcode});
-      if(parsed.overrides) State.overrides = parsed.overrides;
+      if(envelope.settings) Object.assign(State.settings, envelope.settings, {passcode:State.settings.passcode});
+      if(envelope.overrides) State.overrides = envelope.overrides;
+      // Restore optional bundle slices.
+      if(isFullBundle){
+        if(Array.isArray(envelope.loaData)) State.loaData = envelope.loaData;
+        if(Array.isArray(envelope.irregularityData)) State.irregularityData = envelope.irregularityData;
+        if(Array.isArray(envelope.commendationData)) State.commendationData = envelope.commendationData;
+        if(Array.isArray(envelope.approvedLeaveImported)) State.approvedLeaveImported = envelope.approvedLeaveImported;
+      }
       sanitizeDataset(); ensureLeaveTable();
       State.settings.lastSyncedAt = new Date().toISOString();
       State.settings.lastSyncError = '';
+      State.settings.dataSource = 'json-backup';
       await persist();
       jsonStatus.textContent = 'Loaded '+newData.instructors.length+' instructors, '+
         newData.master_schedule.length+' activities from '+file.name+'.';
@@ -4750,11 +5297,13 @@ function adminSettings(main){
     'After uploading a new Excel file, use this to save the parsed data as a JSON file. ' +
     'You can then import that JSON on any device without re-uploading the Excel.'));
   backupCard.appendChild(el('button',{class:'btn gold',onclick:()=>{
-    try{
-      const json = JSON.stringify({data:State.data, settings:State.settings, overrides:State.overrides}, null, 1);
-      downloadFile('roster-data.json', json, 'application/json');
-    }catch(e){ toast('Download failed: '+e.message,'err'); }
-  }},'⬇ Download backup (JSON)'));
+    try{ downloadRosterJson(); }
+    catch(e){ toast('Download failed: '+e.message,'err'); }
+  }},'⬇ Download roster-data.json (publish to GitHub)'));
+  backupCard.appendChild(el('div',{class:'note',style:{marginTop:'.4rem',fontSize:'.82rem'}},
+    'This bundle includes the full merged roster, leave records, irregularities, ' +
+    'commendations, and LOA availability. Commit it to your GitHub Pages repo as ' +
+    '"roster-data.json" beside index.html — phones and laptops will both load it on next open.'));
   const dataInfo = el('div',{class:'muted',style:{fontSize:'.82rem',marginTop:'.5rem'}});
   dataInfo.textContent = 'Current data: ' + (State.data.instructors||[]).length + ' instructors · ' +
     (State.data.master_schedule||[]).length + ' activities · ' +
