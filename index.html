@@ -1228,6 +1228,315 @@ function isSGActivity(act){
   if(_SG_SRC_RE.test(String(act.worksheet_source||''))) return true;
   return false;
 }
+
+/* ─── Wide-format monthly LOG parser (Commendation Log / Irregularity Log) ──
+   Real workbook shape from the user's files:
+     - One sheet per month: "Jan LOG", "Feb LOG", "March LOG", ...
+     - Plus a SUMMARY and a YEAR 2 FACILITATORS sheet that we ignore.
+     - The first row may be blank; the header row appears within the first ~20 rows.
+     - Header includes EMAIL ADDRESS, INSTRUCTOR NAME, DEPARTMENT, Number of logs.
+     - After those four base columns, the row repeats horizontal blocks of
+       Date / Session Type / (Commendation|Incident) Type / Comments /
+       (Acknowledgment Provided|Resolution) / (Praised By|Reported By).
+     - Instructor rows can start several rows below the header. */
+function _wlNorm(v){
+  return String(v == null ? '' : v).trim().toLowerCase().replace(/\s+/g,' ');
+}
+function _wlParseDate(v){
+  if(v == null || v === '') return '';
+  if(v instanceof Date){ return isNaN(v) ? '' : v.toISOString().slice(0,10); }
+  if(typeof v === 'number' && v > 30000 && v < 80000){
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    return isNaN(d) ? '' : d.toISOString().slice(0,10);
+  }
+  const s = String(v).trim();
+  if(!s) return '';
+  if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if(m){ const y = m[3].length===2 ? '20'+m[3] : m[3];
+    return y+'-'+m[1].padStart(2,'0')+'-'+m[2].padStart(2,'0'); }
+  const d = new Date(s);
+  return isNaN(d) ? '' : d.toISOString().slice(0,10);
+}
+function _isMonthlyLogSheetName(sn){
+  const lower = String(sn||'').toLowerCase().trim();
+  if(!/\blog\b/.test(lower)) return false;
+  return /^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(uary|ruary|ch|il|e|y|ust|tember|ober|ember)?\b/.test(lower);
+}
+function _detectWideLogType(wb){
+  let commendHits = 0, irregHits = 0;
+  for(const sn of (wb.SheetNames||[])){
+    const ws = wb.Sheets[sn]; if(!ws || !ws['!ref']) continue;
+    const rows = sheetToRows(ws);
+    const blob = rows.slice(0, 30).map(r => (r||[]).map(_wlNorm).join(' ')).join(' || ');
+    if(/commendation\s*type|acknowledg(?:e)?ment\s*provided|praised\s*by/.test(blob)) commendHits++;
+    if(/incident\s*type|\bresolution\b|reported\s*by/.test(blob)) irregHits++;
+  }
+  if(commendHits && commendHits >= irregHits) return 'commendation_log';
+  if(irregHits) return 'irregularity_log';
+  return 'unknown';
+}
+function parseMonthlyWideLogWorkbook(wb, type, sourceFileName){
+  const isCommend = type === 'commendation_log';
+  const BLOCK_KEYS = isCommend
+    ? [['date',/^date/],['session_type',/^session/],['commendation_type',/^commendation/],
+       ['comments',/^(comments?|notes?)/],['acknowledgment_provided',/^acknowledg/],['praised_by',/^praised/]]
+    : [['date',/^date/],['session_type',/^session/],['incident_type',/^incident/],
+       ['comments',/^(comments?|notes?)/],['resolution',/^resolution/],['reported_by',/^reported/]];
+
+  const records = [];
+  const ignored = [];
+  const recordsBySheet = {};
+  const skipReasons = {};
+  let totalSheets = (wb.SheetNames||[]).length;
+  let monthlySheetsScanned = 0;
+  let instructorRowsScanned = 0;
+  let matched = 0, unmatched = 0, skipped = 0;
+  const bumpSkip = (k) => { skipReasons[k] = (skipReasons[k]||0) + 1; skipped++; };
+
+  for(const sn of (wb.SheetNames||[])){
+    if(!_isMonthlyLogSheetName(sn)){ ignored.push(sn); continue; }
+    monthlySheetsScanned++;
+    const ws = wb.Sheets[sn];
+    if(!ws || !ws['!ref']){ bumpSkip(sn+' — empty sheet'); continue; }
+    const rows = sheetToRows(ws);
+    // Find header row within first 20 rows: must contain EMAIL ADDRESS + INSTRUCTOR NAME.
+    let headerIdx = -1;
+    for(let i = 0; i < Math.min(20, rows.length); i++){
+      const cells = (rows[i]||[]).map(_wlNorm);
+      if(cells.some(c => /email\s*address/.test(c)) &&
+         cells.some(c => /instructor\s*name/.test(c))){ headerIdx = i; break; }
+    }
+    if(headerIdx < 0){ bumpSkip(sn+' — header row not found (need EMAIL ADDRESS + INSTRUCTOR NAME)'); continue; }
+    const header = (rows[headerIdx]||[]).map(_wlNorm);
+    const colEmail = header.findIndex(c => /email\s*address/.test(c));
+    const colName  = header.findIndex(c => /instructor\s*name/.test(c));
+    const colDept  = header.findIndex(c => /department/.test(c));
+    const colNlogs = header.findIndex(c => /number\s*of\s*log/.test(c));
+    const baseColEnd = Math.max(colEmail, colName, colDept, colNlogs);
+
+    // Walk header to the right of base columns and split into repeating blocks.
+    // A new block starts whenever 'date' reappears OR the same key reappears.
+    const blocks = [];
+    let cur = {};
+    for(let c = baseColEnd + 1; c < header.length; c++){
+      const h = header[c]; if(!h) continue;
+      let matchedKey = null;
+      for(const [k, re] of BLOCK_KEYS){ if(re.test(h)){ matchedKey = k; break; } }
+      if(!matchedKey) continue;
+      const startNew = matchedKey === 'date'
+        ? Object.keys(cur).length > 0
+        : Object.prototype.hasOwnProperty.call(cur, matchedKey);
+      if(startNew){ blocks.push(cur); cur = {}; }
+      cur[matchedKey] = c;
+    }
+    if(Object.keys(cur).length) blocks.push(cur);
+    if(!blocks.length){
+      bumpSkip(sn+' — no log-entry blocks detected after the header');
+      continue;
+    }
+
+    let recordsInSheet = 0;
+    for(let r = headerIdx + 1; r < rows.length; r++){
+      const row = rows[r] || [];
+      const email = colEmail >= 0 ? String(row[colEmail]||'').trim().toLowerCase() : '';
+      const name  = colName  >= 0 ? String(row[colName] ||'').trim() : '';
+      const dept  = colDept  >= 0 ? String(row[colDept] ||'').trim() : '';
+      if(!email && !name) continue;
+      // Skip rows that re-state the header.
+      if(/^email\s*address$/i.test(email) || /^instructor\s*name$/i.test(name)) continue;
+      if(email) instructorRowsScanned++;
+      const inst = (email && findInstructor(email)) || (name && findInstructor(name)) || null;
+
+      for(const blk of blocks){
+        const fields = {};
+        let any = false;
+        for(const key of Object.keys(blk)){
+          const cell = row[blk[key]];
+          const val = key === 'date'
+            ? _wlParseDate(cell)
+            : String(cell == null ? '' : cell).trim();
+          if(val) any = true;
+          fields[key] = val || '';
+        }
+        if(!any) continue;
+        const idPrefix = isCommend ? 'commend' : 'irregularity';
+        const id = newId(idPrefix, sourceFileName, sn,
+          email || name, fields.date || '', fields.comments || '',
+          fields[isCommend?'commendation_type':'incident_type'] || '');
+        const description = [
+          fields[isCommend?'commendation_type':'incident_type'],
+          fields.comments,
+          fields[isCommend?'praised_by':'reported_by'] &&
+            ('— ' + (isCommend?'Praised by':'Reported by') + ': ' + fields[isCommend?'praised_by':'reported_by']),
+        ].filter(Boolean).join(' ');
+        records.push(Object.assign({
+          id,
+          email, name, department: dept,
+          instructor_id: inst ? inst.instructor_id : '',
+          source_sheet: sn,
+          source_file: sourceFileName,
+          matched: !!inst,
+          description, // back-compat: existing display uses .description
+        }, fields));
+        recordsInSheet++;
+        if(inst) matched++; else unmatched++;
+      }
+    }
+    recordsBySheet[sn] = recordsInSheet;
+  }
+  return { records, summary: {
+    totalSheets, monthlySheetsScanned, ignored,
+    instructorRowsScanned, matched, unmatched, skipped, skipReasons,
+    recordsBySheet,
+  }};
+}
+
+// Shared driver for the Commendation/Irregularity uploaders.  Reads the
+// uploaded buffer, detects whether it's a wide monthly LOG workbook, parses it
+// into rich records, merges them into State[state_key] (deduping by id), and
+// renders a detailed import summary into the supplied status element.  Falls
+// back to the old simple flat-table parser for CSVs and for Excel files that
+// don't look like a wide LOG workbook (so prior usage isn't broken).
+function _legacyGet(row, pat){
+  const keys = Object.keys(row||{});
+  const k = keys.find(k => pat.test(k.toLowerCase()));
+  return k ? String(row[k]||'').trim() : '';
+}
+async function _processWideLogFile(opts){
+  const { file, buf, status, state_key, expected_type, label, legacy_fields, on_done } = opts;
+  const isCSV = file.name.toLowerCase().endsWith('.csv');
+  // CSV → legacy flat-table path (back-compat, append + dedup).
+  if(isCSV){
+    const text = new TextDecoder().decode(buf);
+    const lines = text.split(/\r?\n/).filter(l => l.trim());
+    if(lines.length < 2){ status.textContent = 'CSV has no data rows.'; return; }
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/^"|"$/g,''));
+    const rows = lines.slice(1).map(l => {
+      const vals = l.split(',').map(v => v.trim().replace(/^"|"$/g,''));
+      const o = {}; headers.forEach((h,i) => o[h] = vals[i]||''); return o;
+    });
+    const newRecs = rows.map(r => {
+      const f = legacy_fields(r);
+      if(!f.name) return null;
+      const id = newId(state_key==='commendationData'?'commend':'irregularity',
+        file.name, f.name, f.date||'', f.description||'');
+      return Object.assign({ id, source_file: file.name, source_sheet: '(csv)', matched: false }, f);
+    }).filter(Boolean);
+    _mergeAndPersistLogRecords(state_key, newRecs);
+    clear(status);
+    status.appendChild(el('div',null, label+' CSV imported: '+newRecs.length+' record(s) from '+file.name+'.'));
+    toast(label+' imported','ok');
+    if(on_done) on_done();
+    return;
+  }
+  // Excel path: detect wide monthly LOG, else fall back to flat-table.
+  const wb = XLSX.read(buf, {cellDates:true});
+  const detected = _detectWideLogType(wb);
+  const monthly = (wb.SheetNames||[]).filter(_isMonthlyLogSheetName);
+  const useWide = monthly.length > 0 && detected !== 'unknown';
+
+  if(!useWide){
+    // Flat-table fallback: first sheet, header on row 1, columns matched by pattern.
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {defval:''});
+    const newRecs = rows.map(r => {
+      const f = legacy_fields(r);
+      if(!f.name) return null;
+      const id = newId(state_key==='commendationData'?'commend':'irregularity',
+        file.name, wb.SheetNames[0]||'', f.name, f.date||'', f.description||'');
+      return Object.assign({ id, source_file: file.name, source_sheet: wb.SheetNames[0]||'', matched: false }, f);
+    }).filter(Boolean);
+    _mergeAndPersistLogRecords(state_key, newRecs);
+    clear(status);
+    if(monthly.length && detected === 'unknown'){
+      status.appendChild(el('div',{class:'note warn'},
+        'Detected monthly LOG sheets but could not tell whether this is a Commendation or Irregularity log. ' +
+        'Falling back to flat-table parsing of the first sheet only. Sheets found: '+
+        (wb.SheetNames||[]).join(', ')));
+    }
+    status.appendChild(el('div',null,
+      label+' imported (flat-table mode): '+newRecs.length+' record(s) from '+file.name+'.'));
+    toast(label+' imported','ok');
+    if(on_done) on_done();
+    return;
+  }
+
+  // Type mismatch sanity check: a Commendation file uploaded into Irregularity tab (or vice versa).
+  // We still import — but warn the user.
+  let typeMismatch = false;
+  if(detected !== expected_type) typeMismatch = true;
+
+  const { records, summary } = parseMonthlyWideLogWorkbook(wb, detected, file.name);
+  _mergeAndPersistLogRecords(state_key, records);
+
+  // ── Render detailed import summary ──────────────────────────────
+  clear(status);
+  if(typeMismatch){
+    status.appendChild(el('div',{class:'note warn',style:{marginBottom:'.4rem'}},
+      'Heads up: this file looks like a '+
+      (detected==='commendation_log'?'Commendation':'Irregularity')+
+      ' log but was uploaded into the '+label+' importer. '+
+      'Records were still parsed and stored in State.'+state_key+' so the tab will show them, '+
+      'but consider uploading it under the matching tab.'));
+  }
+  const sumWrap = el('div',{style:{fontSize:'.85rem',display:'grid',gap:'.2rem'}});
+  sumWrap.appendChild(el('div',null,
+    el('strong',null,'Source file: '), file.name));
+  sumWrap.appendChild(el('div',null,
+    el('strong',null,'Detected workbook type: '),
+    detected==='commendation_log' ? 'Commendation Log'
+      : detected==='irregularity_log' ? 'Irregularity Log' : 'Unknown'));
+  sumWrap.appendChild(el('div',null,
+    el('strong',null,'Sheets scanned: '), String(summary.totalSheets)));
+  sumWrap.appendChild(el('div',null,
+    el('strong',null,'Monthly LOG sheets detected: '), String(summary.monthlySheetsScanned)));
+  sumWrap.appendChild(el('div',null,
+    el('strong',null,'Sheets ignored: '), String(summary.ignored.length),
+    summary.ignored.length ? ' (' + summary.ignored.join(', ') + ')' : ''));
+  sumWrap.appendChild(el('div',null,
+    el('strong',null,'Instructor rows scanned: '), String(summary.instructorRowsScanned)));
+  sumWrap.appendChild(el('div',null,
+    el('strong',null,'Records imported: '), String(records.length),
+    ' · matched ', String(summary.matched),
+    ' · unmatched ', String(summary.unmatched)));
+  if(summary.skipped){
+    sumWrap.appendChild(el('div',null,
+      el('strong',null,'Skipped: '), String(summary.skipped)));
+    const det = el('details',{style:{marginTop:'.2rem'}});
+    det.appendChild(el('summary',{style:{cursor:'pointer'}},'Skip reasons'));
+    const ul = el('ul',{style:{fontSize:'.82rem',margin:'.2rem 0 .2rem 1.2rem'}});
+    Object.entries(summary.skipReasons).forEach(([k,v]) =>
+      ul.appendChild(el('li',null, k+': '+v)));
+    det.appendChild(ul);
+    sumWrap.appendChild(det);
+  }
+  const bySheetKeys = Object.keys(summary.recordsBySheet);
+  if(bySheetKeys.length){
+    sumWrap.appendChild(el('div',null,
+      el('strong',null,'Record count by sheet: '),
+      bySheetKeys.map(k => k+' ('+summary.recordsBySheet[k]+')').join(', ')));
+  }
+  status.appendChild(sumWrap);
+  if(records.length === 0){
+    status.appendChild(el('div',{class:'note warn',style:{marginTop:'.4rem'}},
+      'No records were imported. Likely causes: the header row was not found '+
+      '(must contain "EMAIL ADDRESS" and "INSTRUCTOR NAME"), or no horizontal log blocks '+
+      'were detected after the base columns. Sheets seen: '+(wb.SheetNames||[]).join(', ')+'.'));
+  }
+  toast(label+' import done: '+records.length+' record'+(records.length===1?'':'s'),'ok');
+  if(on_done) on_done();
+}
+function _mergeAndPersistLogRecords(state_key, newRecs){
+  const existing = State[state_key] || [];
+  const byId = {};
+  existing.forEach(r => { if(r && r.id) byId[r.id] = r; });
+  // Keep legacy (no-id) records as-is — they'll persist alongside new ones.
+  const legacy = existing.filter(r => !r || !r.id);
+  newRecs.forEach(r => { if(r && r.id) byId[r.id] = r; });
+  State[state_key] = legacy.concat(Object.values(byId));
+  return persist();
+}
+
 function reviewItem(r){
   const required = r._attendance && r._attendance.attendance_required;
   const item = el('div',{class:'item '+(required?'status-warn':'status-ok')});
@@ -2817,45 +3126,67 @@ function adminImport(main){
     const summary=el('div',{class:'card'});
     function updateIrregSummary(){
       clear(summary);
-      const rows=State.irregularityData||[];
+      const rows = State.irregularityData||[];
+      const unmatchedRows = rows.filter(r => r && r.id && r.matched === false);
       summary.appendChild(el('h3',null,'Currently loaded'));
-      if(!rows.length){ summary.appendChild(el('div',{class:'muted'},'No irregularity data loaded.')); }
-      else {
-        summary.appendChild(el('div',{class:'muted'},rows.length+' record(s).'));
-        const ul=el('ul',{style:{fontSize:'.85rem'}});
-        rows.slice(0,8).forEach(r=>ul.appendChild(el('li',null,(r.name||'?')+(r.date?' — '+r.date:'')+(r.description?' — '+r.description.slice(0,50):''))));
-        if(rows.length>8) ul.appendChild(el('li',null,'…and '+(rows.length-8)+' more'));
-        summary.appendChild(ul);
-        summary.appendChild(el('button',{class:'btn danger small',style:{marginTop:'.5rem'},onclick:async()=>{
-          State.irregularityData=[];await persist();toast('Cleared','ok');updateIrregSummary();
-        }},'Clear data'));
+      if(!rows.length){
+        summary.appendChild(el('div',{class:'muted'},'No irregularity data loaded.'));
+        p.appendChild(summary);
+        return;
       }
+      summary.appendChild(el('div',{class:'muted',style:{fontSize:'.88rem'}},
+        rows.length+' record(s) · '+unmatchedRows.length+' unmatched.'));
+      const ul = el('ul',{style:{fontSize:'.85rem'}});
+      rows.slice(0,12).forEach(r => {
+        const headline = (r.name||'?') +
+          (r.date ? ' — ' + fmtDate(r.date) : '') +
+          (r.incident_type ? ' — ' + r.incident_type : '') +
+          (r.comments ? ' — ' + r.comments.slice(0,60) : (r.description ? ' — ' + r.description.slice(0,60) : ''));
+        ul.appendChild(el('li',null, headline));
+      });
+      if(rows.length > 12) ul.appendChild(el('li',null, '…and '+(rows.length-12)+' more'));
+      summary.appendChild(ul);
+      if(unmatchedRows.length){
+        const det = el('details',{style:{marginTop:'.4rem'}});
+        det.appendChild(el('summary',{style:{cursor:'pointer'}},
+          'Unmatched imported irregularities ('+unmatchedRows.length+')'));
+        const ul2 = el('ul',{style:{fontSize:'.82rem',margin:'.2rem 0 .2rem 1.2rem'}});
+        unmatchedRows.slice(0,50).forEach(r => ul2.appendChild(el('li',null,
+          (r.name||'(no name)') + (r.email?' <'+r.email+'>':'') +
+          (r.date?' · '+fmtDate(r.date):'') +
+          (r.source_sheet?' · '+r.source_sheet:''))));
+        if(unmatchedRows.length > 50)
+          ul2.appendChild(el('li',null,'…and '+(unmatchedRows.length-50)+' more'));
+        det.appendChild(ul2);
+        summary.appendChild(det);
+      }
+      summary.appendChild(el('button',{class:'btn danger small',style:{marginTop:'.5rem'},onclick:async()=>{
+        if(!confirm('Clear all irregularity records on this device?')) return;
+        State.irregularityData = []; await persist(); toast('Cleared','ok'); updateIrregSummary();
+      }},'Clear data'));
     }
     updateIrregSummary(); p.appendChild(summary);
     async function processIrreg(file){
-      status.textContent='Parsing…';
+      clear(status); status.textContent='Parsing…';
       try{
         await ensureSheetJs();
-        const buf=await file.arrayBuffer();
-        let rows;
-        if(file.name.toLowerCase().endsWith('.csv')){
-          const text=new TextDecoder().decode(buf);
-          const lines=text.split('\n').filter(l=>l.trim());
-          const headers=lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/"/g,''));
-          rows=lines.slice(1).map(l=>{const vals=l.split(',').map(v=>v.trim().replace(/"/g,''));const o={};headers.forEach((h,i)=>o[h]=vals[i]||'');return o;});
-        } else {
-          const wb=XLSX.read(buf,{cellDates:true});
-          rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
-        }
-        State.irregularityData=rows.map(r=>{
-          const keys=Object.keys(r);
-          const get=pat=>{const k=keys.find(k=>pat.test(k.toLowerCase()));return k?String(r[k]||'').trim():'';};
-          return {name:get(/name|instructor/),date:get(/date/).slice(0,10),description:get(/desc|note|irregularity|detail|comment/)};
-        }).filter(r=>r.name);
-        await persist();
-        status.textContent='Loaded '+State.irregularityData.length+' records from '+file.name+'.';
-        toast('Irregularity sheet imported','ok'); updateIrregSummary(); fileIn.value='';
-      }catch(err){status.textContent='Failed: '+(err.message||err);toast('Import failed','err');}
+        const buf = await file.arrayBuffer();
+        await _processWideLogFile({
+          file, buf, status,
+          state_key: 'irregularityData',
+          expected_type: 'irregularity_log',
+          label: 'Irregularity',
+          legacy_fields: (row) => ({
+            name: _legacyGet(row,/name|instructor/),
+            date: _legacyGet(row,/date/).slice(0,10),
+            description: _legacyGet(row,/desc|note|irregularity|detail|comment/),
+          }),
+          on_done: ()=>{ updateIrregSummary(); fileIn.value=''; },
+        });
+      }catch(err){
+        status.textContent = 'Failed: '+(err.message||err);
+        toast('Import failed','err');
+      }
     }
   })();
 
@@ -2879,45 +3210,67 @@ function adminImport(main){
     const summary=el('div',{class:'card'});
     function updateCommendSummary(){
       clear(summary);
-      const rows=State.commendationData||[];
+      const rows = State.commendationData||[];
+      const unmatchedRows = rows.filter(r => r && r.id && r.matched === false);
       summary.appendChild(el('h3',null,'Currently loaded'));
-      if(!rows.length){ summary.appendChild(el('div',{class:'muted'},'No commendation data loaded.')); }
-      else {
-        summary.appendChild(el('div',{class:'muted'},rows.length+' record(s).'));
-        const ul=el('ul',{style:{fontSize:'.85rem'}});
-        rows.slice(0,8).forEach(r=>ul.appendChild(el('li',null,(r.name||'?')+(r.date?' — '+r.date:'')+(r.description?' — '+r.description.slice(0,50):''))));
-        if(rows.length>8) ul.appendChild(el('li',null,'…and '+(rows.length-8)+' more'));
-        summary.appendChild(ul);
-        summary.appendChild(el('button',{class:'btn danger small',style:{marginTop:'.5rem'},onclick:async()=>{
-          State.commendationData=[];await persist();toast('Cleared','ok');updateCommendSummary();
-        }},'Clear data'));
+      if(!rows.length){
+        summary.appendChild(el('div',{class:'muted'},'No commendation data loaded.'));
+        p.appendChild(summary);
+        return;
       }
+      summary.appendChild(el('div',{class:'muted',style:{fontSize:'.88rem'}},
+        rows.length+' record(s) · '+unmatchedRows.length+' unmatched.'));
+      const ul = el('ul',{style:{fontSize:'.85rem'}});
+      rows.slice(0,12).forEach(r => {
+        const headline = (r.name||'?') +
+          (r.date ? ' — ' + fmtDate(r.date) : '') +
+          (r.commendation_type ? ' — ' + r.commendation_type : '') +
+          (r.comments ? ' — ' + r.comments.slice(0,60) : (r.description ? ' — ' + r.description.slice(0,60) : ''));
+        ul.appendChild(el('li',null, headline));
+      });
+      if(rows.length > 12) ul.appendChild(el('li',null, '…and '+(rows.length-12)+' more'));
+      summary.appendChild(ul);
+      if(unmatchedRows.length){
+        const det = el('details',{style:{marginTop:'.4rem'}});
+        det.appendChild(el('summary',{style:{cursor:'pointer'}},
+          'Unmatched imported commendations ('+unmatchedRows.length+')'));
+        const ul2 = el('ul',{style:{fontSize:'.82rem',margin:'.2rem 0 .2rem 1.2rem'}});
+        unmatchedRows.slice(0,50).forEach(r => ul2.appendChild(el('li',null,
+          (r.name||'(no name)') + (r.email?' <'+r.email+'>':'') +
+          (r.date?' · '+fmtDate(r.date):'') +
+          (r.source_sheet?' · '+r.source_sheet:''))));
+        if(unmatchedRows.length > 50)
+          ul2.appendChild(el('li',null,'…and '+(unmatchedRows.length-50)+' more'));
+        det.appendChild(ul2);
+        summary.appendChild(det);
+      }
+      summary.appendChild(el('button',{class:'btn danger small',style:{marginTop:'.5rem'},onclick:async()=>{
+        if(!confirm('Clear all commendation records on this device?')) return;
+        State.commendationData = []; await persist(); toast('Cleared','ok'); updateCommendSummary();
+      }},'Clear data'));
     }
     updateCommendSummary(); p.appendChild(summary);
     async function processCommend(file){
-      status.textContent='Parsing…';
+      clear(status); status.textContent='Parsing…';
       try{
         await ensureSheetJs();
-        const buf=await file.arrayBuffer();
-        let rows;
-        if(file.name.toLowerCase().endsWith('.csv')){
-          const text=new TextDecoder().decode(buf);
-          const lines=text.split('\n').filter(l=>l.trim());
-          const headers=lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/"/g,''));
-          rows=lines.slice(1).map(l=>{const vals=l.split(',').map(v=>v.trim().replace(/"/g,''));const o={};headers.forEach((h,i)=>o[h]=vals[i]||'');return o;});
-        } else {
-          const wb=XLSX.read(buf,{cellDates:true});
-          rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
-        }
-        State.commendationData=rows.map(r=>{
-          const keys=Object.keys(r);
-          const get=pat=>{const k=keys.find(k=>pat.test(k.toLowerCase()));return k?String(r[k]||'').trim():'';};
-          return {name:get(/name|instructor/),date:get(/date/).slice(0,10),description:get(/desc|note|commend|detail|comment/)};
-        }).filter(r=>r.name);
-        await persist();
-        status.textContent='Loaded '+State.commendationData.length+' records from '+file.name+'.';
-        toast('Commendation sheet imported','ok'); updateCommendSummary(); fileIn.value='';
-      }catch(err){status.textContent='Failed: '+(err.message||err);toast('Import failed','err');}
+        const buf = await file.arrayBuffer();
+        await _processWideLogFile({
+          file, buf, status,
+          state_key: 'commendationData',
+          expected_type: 'commendation_log',
+          label: 'Commendation',
+          legacy_fields: (row) => ({
+            name: _legacyGet(row,/name|instructor/),
+            date: _legacyGet(row,/date/).slice(0,10),
+            description: _legacyGet(row,/desc|note|commend|detail|comment/),
+          }),
+          on_done: ()=>{ updateCommendSummary(); fileIn.value=''; },
+        });
+      }catch(err){
+        status.textContent = 'Failed: '+(err.message||err);
+        toast('Import failed','err');
+      }
     }
   })();
 
@@ -3390,19 +3743,37 @@ function lateCountForInstructor(id){
     /^late/i.test((a.role||'').trim())
   ).length;
 }
+// Match log records to an instructor by:
+//   1. instructor_id (set by the wide-log parser when matching succeeded), OR
+//   2. SGU email (case-insensitive exact match), OR
+//   3. first-name-token contained in record's stored name (legacy fallback).
+function _matchLogRecordsForInstructor(arr, nameOrInst){
+  if(!arr || !arr.length) return [];
+  // Caller may pass an instructor object (has full_name/email/instructor_id)
+  // OR just a name string (legacy callers).
+  let fullName, email, id;
+  if(nameOrInst && typeof nameOrInst === 'object'){
+    fullName = nameOrInst.full_name || ''; email = (nameOrInst.email||'').toLowerCase(); id = nameOrInst.instructor_id || '';
+  } else {
+    fullName = String(nameOrInst||''); email = ''; id = '';
+    const found = findInstructor(fullName);
+    if(found){ email = (found.email||'').toLowerCase(); id = found.instructor_id; }
+  }
+  if(!fullName && !email && !id) return [];
+  const firstToken = (fullName||'').toLowerCase().trim().split(/\s+/)[0] || '';
+  return arr.filter(r => {
+    if(!r) return false;
+    if(id && r.instructor_id && r.instructor_id === id) return true;
+    if(email && r.email && r.email.toLowerCase() === email) return true;
+    if(firstToken && r.name && r.name.toLowerCase().includes(firstToken)) return true;
+    return false;
+  });
+}
 function irregularitiesForInstructor(name){
-  if(!name) return [];
-  const nl = name.toLowerCase();
-  return (State.irregularityData||[]).filter(r =>
-    r.name && r.name.toLowerCase().includes(nl.split(' ')[0])
-  );
+  return _matchLogRecordsForInstructor(State.irregularityData||[], name);
 }
 function commendationsForInstructor(name){
-  if(!name) return [];
-  const nl = name.toLowerCase();
-  return (State.commendationData||[]).filter(r =>
-    r.name && r.name.toLowerCase().includes(nl.split(' ')[0])
-  );
+  return _matchLogRecordsForInstructor(State.commendationData||[], name);
 }
 
 /* -------- DEPARTMENT CHAIR VIEW ----------------------- */
@@ -3581,6 +3952,29 @@ function showDeptInstructorDetail(r, dept){
   body.appendChild(el('div',{class:'note '+(lateCount?'warn':'')},
     'Late to sessions: '+lateCount));
 
+  // Surface richer log fields when present (incident_type/commendation_type, comments,
+  // resolution/acknowledgment, reported_by/praised_by) — falls back to .description
+  // for legacy records imported with the old flat-table parser.
+  function _renderLogLine(e, isCommend){
+    const parts = [];
+    if(e.date) parts.push(fmtDate(e.date));
+    const typeField = isCommend ? e.commendation_type : e.incident_type;
+    if(typeField) parts.push(typeField);
+    if(e.session_type) parts.push(e.session_type);
+    const trailer = [];
+    if(e.comments) trailer.push(e.comments);
+    else if(e.description) trailer.push(e.description);
+    if(isCommend){
+      if(e.acknowledgment_provided) trailer.push('Acknowledged: '+e.acknowledgment_provided);
+      if(e.praised_by) trailer.push('Praised by: '+e.praised_by);
+    } else {
+      if(e.resolution) trailer.push('Resolution: '+e.resolution);
+      if(e.reported_by) trailer.push('Reported by: '+e.reported_by);
+    }
+    if(e.source_sheet) trailer.push('source: '+e.source_sheet);
+    return parts.join(' — ') + (trailer.length ? ' — ' + trailer.join(' · ') : '');
+  }
+
   // Irregularities
   const irregs = irregularitiesForInstructor(r.full_name);
   body.appendChild(el('h3',{style:{marginTop:'.8rem'}},null,'Irregularities'));
@@ -3588,8 +3982,7 @@ function showDeptInstructorDetail(r, dept){
     body.appendChild(el('div',{style:{fontSize:'.85rem',color:'var(--text-dim)'}},'None on record.'));
   } else {
     const ul=el('ul',{style:{fontSize:'.85rem'}});
-    irregs.forEach(e=>ul.appendChild(el('li',null,
-      (e.date?fmtDate(e.date)+' — ':'')+e.description)));
+    irregs.forEach(e=>ul.appendChild(el('li',null, _renderLogLine(e, false))));
     body.appendChild(ul);
   }
 
@@ -3600,8 +3993,7 @@ function showDeptInstructorDetail(r, dept){
     body.appendChild(el('div',{style:{fontSize:'.85rem',color:'var(--text-dim)'}},'None on record.'));
   } else {
     const ul=el('ul',{style:{fontSize:'.85rem'}});
-    commends.forEach(e=>ul.appendChild(el('li',null,
-      (e.date?fmtDate(e.date)+' — ':'')+e.description)));
+    commends.forEach(e=>ul.appendChild(el('li',null, _renderLogLine(e, true))));
     body.appendChild(ul);
   }
 
@@ -3798,6 +4190,15 @@ function renderSupervisingFacultyView(){
   // Past-date toggle: by default skip past dates (no point recommending them)
   const inclPast = el('input',{type:'checkbox'});
   slotWrap.appendChild(el('label',{style:{display:'flex',alignItems:'center',gap:'.3rem',cursor:'pointer'}}, inclPast, 'Include past dates'));
+  // Minimum-availability threshold: show options with at least N% of selected instructors free.
+  // Default 60% so coordinators see strong/acceptable options, not only 100%.
+  const threshSel = el('select',{},
+    el('option',{value:'60'}, 'At least 60% available (acceptable)'),
+    el('option',{value:'70'}, 'At least 70% available (strong)'),
+    el('option',{value:'100'},'Only 100% available (everyone free)'));
+  threshSel.value = '60';
+  slotWrap.appendChild(el('label',{style:{display:'flex',alignItems:'center',gap:'.3rem'}},
+    el('span',{class:'muted',style:{fontSize:'.85rem'}}, 'Min availability:'), threshSel));
   recCard.appendChild(slotWrap);
   const findBtn = el('button',{class:'btn',style:{marginTop:'.6rem'}},'Find best available time');
   recCard.appendChild(findBtn);
@@ -3940,38 +4341,59 @@ function renderSupervisingFacultyView(){
         (includePast?'':' on or after today')+'.'));
       return;
     }
-    // Sort: highest available count first, then earliest date, then earliest slot.
-    candidates.sort((a,b) => b.count - a.count
-      || a.date.localeCompare(b.date)
-      || a.slotS - b.slotS);
-    const top = candidates.slice(0, 10);
-
+    // Apply minimum-availability threshold.  Bucketed grouping below keeps the
+    // best options visible while still surfacing strong/acceptable alternatives.
+    const minPct = +threshSel.value;
+    const eligible = candidates.filter(c => c.pct >= minPct);
+    if(!eligible.length){
+      const bestSeen = candidates.reduce((m,c) => c.pct > m ? c.pct : m, 0);
+      recResult.appendChild(el('div',{class:'note warn',style:{marginTop:'.6rem'}},
+        'No slot meets the '+minPct+'% threshold for the selected instructors. '+
+        'The highest availability seen was '+bestSeen+'%. '+
+        'Try lowering the "Min availability" setting or selecting fewer SG activities.'));
+      return;
+    }
+    // Bucket by availability tier, then sort each bucket by date+time so the
+    // chronological flow is easy to scan.
+    const buckets = [
+      { name:'Best options — 100% available',     minPct:100, maxPct:100, color:'var(--green-soft)' },
+      { name:'Strong options — 70–99% available', minPct:70,  maxPct:99,  color:'var(--yellow-soft)' },
+      { name:'Acceptable options — 60–69% available', minPct:60, maxPct:69, color:'var(--surface-2)' },
+    ];
+    for(const b of buckets){
+      b.items = eligible
+        .filter(c => c.pct >= b.minPct && c.pct <= b.maxPct)
+        .sort((x,y) => x.date.localeCompare(y.date) || x.slotS - y.slotS)
+        .slice(0, 20);  // cap each bucket so the UI stays manageable
+    }
+    const totalShown = buckets.reduce((n,b) => n + b.items.length, 0);
     recResult.appendChild(el('h3',{style:{marginTop:'.8rem'}},
-      'Top '+top.length+' option'+(top.length===1?'':'s')+' · '+
-      instIdArr.length+' instructor'+(instIdArr.length===1?'':'s')+
-      ' from '+selectedIds.size+' SG activit'+(selectedIds.size===1?'y':'ies')));
+      'Top time options · '+instIdArr.length+' instructor'+
+      (instIdArr.length===1?'':'s')+' from '+selectedIds.size+
+      ' SG activit'+(selectedIds.size===1?'y':'ies')+
+      ' · threshold ≥ '+minPct+'%' ));
+    recResult.appendChild(el('div',{class:'muted',style:{fontSize:'.85rem',marginBottom:'.4rem'}},
+      eligible.length+' slot'+(eligible.length===1?'':'s')+' met the threshold; showing '+
+      totalShown+' across buckets (up to 20 per bucket).'));
 
-    top.forEach((c, i) => {
-      const isBest = i === 0;
+    function renderSlot(c, isBest, bgColor){
       const summary = (isBest?'⭐ ':'') +
         fmtDateLong(c.date) + ', ' + minToHHMM(c.slotS) + '–' + minToHHMM(c.slotE) +
         ' — ' + c.count + ' of ' + c.total + ' instructors available (' + c.pct + '%)';
       const det = el('details',{style:{
         border:'1px solid var(--border)',borderRadius:'var(--radius)',
-        padding:'.5rem .7rem',marginTop:'.4rem',
-        background: isBest ? 'var(--green-soft)' : 'var(--surface)'}});
-      if(isBest) det.setAttribute('open',''); // expand best by default
+        padding:'.5rem .7rem',marginTop:'.35rem',
+        background: bgColor || 'var(--surface)'}});
+      if(isBest) det.setAttribute('open','');
       const sum = el('summary',{style:{cursor:'pointer',fontWeight:600}});
       sum.appendChild(document.createTextNode(summary));
       det.appendChild(sum);
-
       const availNames = c.avail.map(id => (instructorById(id)||{}).full_name).filter(Boolean)
         .sort((a,b)=>a.localeCompare(b));
       const unavailRows = c.unavail.map(o => {
         const inst = instructorById(o.id) || {};
         return { name: inst.full_name || '(unknown)', reason: o.reason };
       }).sort((a,b)=>a.name.localeCompare(b.name));
-
       const body = el('div',{style:{marginTop:'.4rem',fontSize:'.85rem',display:'grid',gap:'.3rem'}});
       body.appendChild(el('div',null,
         el('strong',null, 'Available ('+availNames.length+'): '),
@@ -3980,7 +4402,20 @@ function renderSupervisingFacultyView(){
         el('strong',null, 'Unavailable ('+unavailRows.length+'): '),
         el('span',null, unavailRows.map(r => r.name+' ('+r.reason+')').join(', ') || '—')));
       det.appendChild(body);
-      recResult.appendChild(det);
+      return det;
+    }
+
+    let renderedAny = false;
+    buckets.forEach(bucket => {
+      if(!bucket.items.length) return;
+      recResult.appendChild(el('h4',{style:{marginTop:'.8rem',marginBottom:'.2rem'}},
+        bucket.name+' ('+bucket.items.length+(eligible.filter(c => c.pct >= bucket.minPct && c.pct <= bucket.maxPct).length > bucket.items.length
+          ? ' of '+eligible.filter(c => c.pct >= bucket.minPct && c.pct <= bucket.maxPct).length : '')+')'));
+      bucket.items.forEach((c, i) => {
+        const isBestOverall = !renderedAny && i === 0;
+        recResult.appendChild(renderSlot(c, isBestOverall, bucket.color));
+        renderedAny = true;
+      });
     });
 
     recResult.appendChild(el('div',{class:'muted',style:{fontSize:'.8rem',marginTop:'.5rem'}},
