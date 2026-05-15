@@ -307,7 +307,7 @@ small.muted{font-size:.78rem}
 ========================================================= */
 
 /* -------- 1. STATE & STORAGE --------------------------- */
-const DEFAULT_PASSCODE = "1234"; // coordinator passcode (override in Settings)
+const DEFAULT_PASSCODE = "4xEr5qbQ1uEMNCMsv4yp"; // coordinator passcode (override in Settings)
 // Department chair passwords (change these as needed)
 const DEPT_PASSCODES = {
   "Microbiology-Pharmacology": "micro123",
@@ -1118,13 +1118,6 @@ function buildVersionFooter(){
     ? new Date(ts).toLocaleString() + ' (' + fmtRelativeTime(ts) + ')'
     : 'never';
   const src = (State.settings && State.settings.dataSource) || 'seed';
-  const SRC_LABEL = {
-    published:    {text:'Published JSON (shared on GitHub Pages)', kind:'green'},
-    local:        {text:'Local Excel upload only (this device)',   kind:'yellow'},
-    'json-backup':{text:'Local JSON backup (this device)',         kind:'yellow'},
-    seed:         {text:'Embedded seed fallback',                  kind:'gray'},
-  };
-  const srcInfo = SRC_LABEL[src] || SRC_LABEL.seed;
   const box = el('div',{class:'muted', style:{
     margin:'1rem auto 0',padding:'.55rem .8rem',fontSize:'.72rem',
     textAlign:'center',maxWidth:'560px',lineHeight:'1.55',
@@ -1139,10 +1132,6 @@ function buildVersionFooter(){
   box.appendChild(el('div',null,
     el('strong',null,'Data version: '),
     el('span',null, String(dataVersion))
-  ));
-  box.appendChild(el('div',null,
-    el('strong',null,'Data source: '),
-    el('span',{class:'badge '+srcInfo.kind, style:{verticalAlign:'baseline'}}, srcInfo.text)
   ));
   box.appendChild(el('div',null,
     el('strong',null,'Last imported: '),
@@ -1175,9 +1164,7 @@ function kpi(n, lbl, kind){
 }
 function requireCoordinator(then){
   const input = el('input',{type:'password',placeholder:'Coordinator passcode',autofocus:true});
-  const note = el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.4rem'}},
-    `Default passcode: ${DEFAULT_PASSCODE} — change in Settings after first sign-in.`);
-  modal('Coordinator sign-in', [input, note], [
+  modal('Coordinator sign-in', [input], [
     el('button',{class:'btn secondary',onclick:closeModal}, 'Cancel'),
     el('button',{class:'btn',onclick:()=>{
       if(input.value === State.settings.passcode){ closeModal(); then(); }
@@ -2807,6 +2794,52 @@ function instructorProfile(main){
     att.appendChild(el('div',{class:'empty'}, 'No absences on record.'));
   }
   main.appendChild(att);
+
+  // Review session attendance — fed from the "Review session attendance"
+  // worksheet via the review_attendance table.  When the worksheet hasn't
+  // been parsed yet (older published JSON), `has_data` is false and we
+  // surface a hint instead of misleading zeros.
+  const rev = reviewAttendanceForInstructor(m.instructor_id);
+  const revCard = el('div',{class:'card'});
+  revCard.appendChild(el('h2',null,'Review Session Attendance'));
+  const rks = el('div',{class:'kpi-grid'});
+  rks.appendChild(kpi(rev.total_absent, 'Review sessions absent', rev.total_absent?'warn':'ok'));
+  rks.appendChild(kpi(rev.absent_with,    'Absent w/ email/notification'));
+  rks.appendChild(kpi(rev.absent_without, 'Absent w/o email/notification', rev.absent_without?'err':'ok'));
+  revCard.appendChild(rks);
+  if(!rev.has_data){
+    revCard.appendChild(el('div',{class:'empty'},
+      'No review session attendance records found. Re-import the workbook (the "Review session attendance" worksheet is parsed automatically) to populate this section.'));
+  } else if(!rev.total_absent){
+    revCard.appendChild(el('div',{class:'empty'}, 'No review session absences on record.'));
+  } else {
+    function _renderRevList(title, arr, badgeClass, badgeText){
+      if(!arr.length) return;
+      revCard.appendChild(el('h3',{style:{marginTop:'.6rem'}}, title+' — '+arr.length));
+      const ul = el('div',{class:'list',style:{marginTop:'.3rem'}});
+      arr.forEach(r => {
+        const dateLbl = r.review_date ? fmtDateLong(r.review_date) : 'Unknown date';
+        const timeLbl = r.review_start_time ? ' · '+r.review_start_time : '';
+        const sessLbl = r.activity_name || r.sg_code || r.discipline || 'Review session';
+        const courseLbl = [r.course, r.module].filter(Boolean).join(' / ');
+        ul.appendChild(el('div',{class:'item'},
+          el('div',{class:'item-head'},
+            el('div',{class:'item-title'}, dateLbl + timeLbl),
+            el('span',{class:'badge '+badgeClass}, r.attendance_status || badgeText)
+          ),
+          el('div',{class:'meta'},
+            el('span',null, sessLbl),
+            courseLbl ? el('span',null, courseLbl) : null,
+            r.review_location ? el('span',null, r.review_location) : null
+          )
+        ));
+      });
+      revCard.appendChild(ul);
+    }
+    _renderRevList('Absent with email/notification', rev.detailsWith,    'yellow', 'Absent w/ notification');
+    _renderRevList('Absent without email/notification', rev.detailsWithout, 'red',    'Absent w/o notification');
+  }
+  main.appendChild(revCard);
 
   const btnCard = el('div',{class:'card'});
   const btns = el('div',{class:'cluster'});
@@ -4499,11 +4532,27 @@ function renderDeptChairView(dept){
     const d = (inst.department||'').toLowerCase();
     return aliases.some(a => d.includes(a));
   });
+  // Review-session attendance summary per instructor in this department.
+  const revByInst = {};
+  let revTotalDept = 0, revWithDept = 0, revWithoutDept = 0;
+  let anyRevData = false;
+  deptInstructors.forEach(i => {
+    const ra = reviewAttendanceForInstructor(i.instructor_id);
+    revByInst[i.instructor_id] = ra;
+    revTotalDept   += ra.total_absent;
+    revWithDept    += ra.absent_with;
+    revWithoutDept += ra.absent_without;
+    if(ra.has_data) anyRevData = true;
+  });
+
   const ks = el('div',{class:'kpi-grid'});
   ks.appendChild(kpi(deptInstructors.length, 'Instructors'));
   ks.appendChild(kpi(report.reduce((s,r)=>s+r.total_days,0), 'Total absences', 'warn'));
   ks.appendChild(kpi(report.reduce((s,r)=>s+r.unexcused_days,0), 'Absent w/o Notification', 'err'));
   ks.appendChild(kpi(report.reduce((s,r)=>s+r.excused_days,0), 'Absent w/ Notification'));
+  ks.appendChild(kpi(revTotalDept,   'Review session absences', revTotalDept?'warn':'ok'));
+  ks.appendChild(kpi(revWithDept,    'Review absences w/ email'));
+  ks.appendChild(kpi(revWithoutDept, 'Review absences w/o email', revWithoutDept?'err':'ok'));
   main.appendChild(ks);
 
   // Absence summary table
@@ -4512,15 +4561,21 @@ function renderDeptChairView(dept){
   absCard.appendChild(el('div',{class:'note',style:{marginBottom:'.6rem'}},
     el('strong',null,'Absent w/ Notification'), ': instructor notified coordinator via email but was absent. ',
     el('strong',null,'Absent w/o Notification'), ': absent with no prior notification.'));
+  if(!anyRevData){
+    absCard.appendChild(el('div',{class:'note warn',style:{marginBottom:'.6rem',fontSize:'.85rem'}},
+      'Review-session attendance columns will be empty until the "Review session attendance" worksheet is parsed (re-import the workbook to populate).'));
+  }
   const tbl = el('table',{class:'tbl'});
   tbl.appendChild(el('tr',{},
-    ...['Instructor','Absent w/ Notification','Absent w/o Notification','Late','Irregularities','Commendations','Total'].map(h=>el('th',{},h))
+    ...['Instructor','Absent w/ Notification','Absent w/o Notification','Late','Irregularities','Commendations','Review absences (total)','Review w/ email','Review w/o email','Total'].map(h=>el('th',{},h))
   ));
   report.forEach(r => {
     const sev = r.total_days >= 5 ? 'red' : r.total_days >= 3 ? 'yellow' : r.total_days ? 'gray' : 'green';
     const lateN   = lateCountForInstructor(r.instructor_id);
     const irregN  = irregularitiesForInstructor(r.full_name).length;
     const commendN = commendationsForInstructor(r.full_name).length;
+    const ra = revByInst[r.instructor_id] || {total_absent:0, absent_with:0, absent_without:0};
+    const revSev = ra.total_absent >= 5 ? 'red' : ra.total_absent >= 3 ? 'yellow' : ra.total_absent ? 'gray' : 'green';
     tbl.appendChild(el('tr',{style:{cursor:'pointer'},onclick:()=>showDeptInstructorDetail(r,dept)},
       el('td',{},r.full_name),
       el('td',{},el('span',{class:'badge blue'},String(r.excused_days))),
@@ -4528,6 +4583,9 @@ function renderDeptChairView(dept){
       el('td',{},el('span',{class:'badge '+(lateN?'yellow':'gray')},String(lateN))),
       el('td',{},el('span',{class:'badge '+(irregN?'red':'gray')},String(irregN))),
       el('td',{},el('span',{class:'badge '+(commendN?'green':'gray')},String(commendN))),
+      el('td',{},el('span',{class:'badge '+revSev},String(ra.total_absent))),
+      el('td',{},el('span',{class:'badge '+(ra.absent_with?'yellow':'gray')},String(ra.absent_with))),
+      el('td',{},el('span',{class:'badge '+(ra.absent_without?'red':'gray')},String(ra.absent_without))),
       el('td',{},el('span',{class:'badge '+sev},String(r.total_days)))
     ));
   });
@@ -4679,6 +4737,47 @@ function showDeptInstructorDetail(r, dept){
     const ul=el('ul',{style:{fontSize:'.85rem'}});
     commends.forEach(e=>ul.appendChild(el('li',null, _renderLogLine(e, true))));
     body.appendChild(ul);
+  }
+
+  // Review session attendance detail (from the "Review session attendance"
+  // worksheet).
+  const ra = reviewAttendanceForInstructor(r.instructor_id);
+  body.appendChild(el('h3',{style:{marginTop:'.8rem'}},null,'Review Session Attendance'));
+  body.appendChild(el('div',{class:'meta'},
+    el('span',null, 'Total absences: '+ra.total_absent),
+    el('span',null, 'With email/notification: '+ra.absent_with),
+    el('span',null, 'Without email/notification: '+ra.absent_without)
+  ));
+  function _revLine(d){
+    const parts = [];
+    if(d.review_date) parts.push(fmtDate(d.review_date));
+    if(d.review_start_time) parts.push(d.review_start_time);
+    if(d.activity_name || d.sg_code || d.discipline) parts.push(d.activity_name || d.sg_code || d.discipline);
+    if(d.course || d.module) parts.push([d.course,d.module].filter(Boolean).join(' / '));
+    if(d.review_location) parts.push(d.review_location);
+    parts.push('['+(d.attendance_status||'?')+']');
+    return parts.join(' — ');
+  }
+  if(!ra.has_data){
+    body.appendChild(el('div',{style:{fontSize:'.85rem',color:'var(--text-dim)'}},
+      'No review-attendance worksheet data on record (re-import the workbook to populate).'));
+  } else if(!ra.total_absent){
+    body.appendChild(el('div',{style:{fontSize:'.85rem',color:'var(--text-dim)'}},'No review session absences on record.'));
+  } else {
+    if(ra.detailsWith.length){
+      body.appendChild(el('div',{style:{fontSize:'.85rem',marginTop:'.3rem'}},
+        el('strong',null,'Absent with email/notification — '+ra.detailsWith.length)));
+      const ul=el('ul',{style:{fontSize:'.85rem'}});
+      ra.detailsWith.forEach(d=>ul.appendChild(el('li',null, _revLine(d))));
+      body.appendChild(ul);
+    }
+    if(ra.detailsWithout.length){
+      body.appendChild(el('div',{style:{fontSize:'.85rem',marginTop:'.3rem'}},
+        el('strong',null,'Absent without email/notification — '+ra.detailsWithout.length)));
+      const ul=el('ul',{style:{fontSize:'.85rem'}});
+      ra.detailsWithout.forEach(d=>ul.appendChild(el('li',null, _revLine(d))));
+      body.appendChild(ul);
+    }
   }
 
   modal(r.full_name, body, [el('button',{class:'btn',onclick:closeModal},'Close')]);
@@ -5191,9 +5290,12 @@ function adminExport(main){
 function adminPasswords(main){
   const card = el('div',{class:'card'});
   card.appendChild(el('h2',null,'Manage Role Passwords'));
-  card.appendChild(el('div',{class:'note',style:{marginBottom:'.8rem'}},
+  card.appendChild(el('div',{class:'note',style:{marginBottom:'.4rem'}},
     'Set custom passwords for each role below. Leave a field blank to keep using the built-in default. ' +
-    'Changes are saved to this device — anyone using a different browser will still see the defaults until you update those too.'));
+    'Changes are saved to this browser/device only (localStorage) and do not publish to other users automatically.'));
+  card.appendChild(el('div',{class:'note warn',style:{marginBottom:'.8rem'}},
+    el('strong',null,'Local only. '),
+    'Password changes affect only this browser/device. They are not pushed to GitHub Pages and other users will continue to use whatever default or override is configured on their device until the published build is updated.'));
 
   const fields = {};
   const depts = Object.keys(DEPT_PASSCODES);
@@ -5203,7 +5305,7 @@ function adminPasswords(main){
   depts.forEach(dept => {
     const current = (State.settings.deptPasscodes&&State.settings.deptPasscodes[dept]) || '';
     const inp = el('input',{type:'password',
-      placeholder:'Default: '+DEPT_PASSCODES[dept],
+      placeholder:'(unchanged — leave blank to keep default)',
       value: current,
       autocomplete:'new-password'});
     fields[dept] = inp;
@@ -5216,7 +5318,7 @@ function adminPasswords(main){
   // Supervising faculty field
   card.appendChild(el('h3',{style:{marginTop:'.8rem'}},null,'Supervising Faculty Password'));
   const supInp = el('input',{type:'password',
-    placeholder:'Default: '+SUPERVISING_PASSCODE,
+    placeholder:'(unchanged — leave blank to keep default)',
     value: State.settings.supervisingPasscode||'',
     autocomplete:'new-password'});
   card.appendChild(el('label',{style:{display:'block',marginBottom:'.5rem'}},
@@ -5261,41 +5363,32 @@ function adminPasswords(main){
 
   main.appendChild(card);
 
-  // Current effective passwords summary
-  const summary = el('div',{class:'card'});
-  summary.appendChild(el('h3',null,'Current effective passwords'));
-  summary.appendChild(el('div',{class:'note warn',style:{marginBottom:'.6rem'}},
-    'These are the passwords currently in effect on this device. Share them securely.'));
-  const tbl = el('table',{class:'tbl'});
-  tbl.appendChild(el('tr',{},...['Role','Password'].map(h=>el('th',{},h))));
-  depts.forEach(dept=>{
-    const pw = (State.settings.deptPasscodes&&State.settings.deptPasscodes[dept]) || DEPT_PASSCODES[dept];
-    tbl.appendChild(el('tr',{},
-      el('td',{},dept+' Chair'),
-      el('td',{},el('span',{class:'kbd'},pw))
-    ));
-  });
-  const supPw = State.settings.supervisingPasscode || SUPERVISING_PASSCODE;
-  tbl.appendChild(el('tr',{},
-    el('td',{},'Supervising Faculty'),
-    el('td',{},el('span',{class:'kbd'},supPw))
-  ));
-  const coordPw = State.settings.passcode || DEFAULT_PASSCODE;
-  tbl.appendChild(el('tr',{},
-    el('td',{},'Coordinator (set in Settings tab)'),
-    el('td',{},el('span',{class:'kbd'},coordPw))
-  ));
-  summary.appendChild(el('div',{class:'tbl-wrap'},tbl));
-  main.appendChild(summary);
+  // NOTE: previous versions rendered a "Current effective passwords" plaintext
+  // table here that exposed every role password (including any unchanged built-in
+  // defaults). That was a public credential disclosure on a shared GitHub Pages
+  // build. Removed deliberately — coordinators should hand out role passwords
+  // through an out-of-band channel.
 }
 
 function adminSettings(main){
-  // ── Download backup (most important — shown first) ──────────
+  // ── PUBLISHED / GLOBAL section header ──────────────────────────
+  // Explicitly separates settings that travel to all users (via the
+  // published roster-data.json on GitHub Pages) from purely local ones.
+  const pubHeader = el('div',{class:'card',style:{background:'var(--green-soft)'}});
+  pubHeader.appendChild(el('h2',null,'Published / Global data'));
+  pubHeader.appendChild(el('div',{class:'note'},
+    'This section is the ', el('strong',null,'only'), ' way to change what other users (phones, laptops, anyone visiting the GitHub Pages site) see. ' +
+    'Download the updated roster-data.json below and commit it to your GitHub Pages repo as ' +
+    '"roster-data.json" beside index.html. Until you do that, other devices will keep loading the previously published copy.'));
+  main.appendChild(pubHeader);
+
+  // ── Download backup (publishing artefact) ───────────────────
   const backupCard = el('div',{class:'card'});
-  backupCard.appendChild(el('h2',null,'Download data backup'));
+  backupCard.appendChild(el('h2',null,'Download data backup (publish to GitHub)'));
   backupCard.appendChild(el('div',{class:'note',style:{marginBottom:'.7rem'}},
     'After uploading a new Excel file, use this to save the parsed data as a JSON file. ' +
-    'You can then import that JSON on any device without re-uploading the Excel.'));
+    'You can then import that JSON on any device without re-uploading the Excel, ' +
+    'and you can publish it to GitHub Pages so all users see the new data.'));
   backupCard.appendChild(el('button',{class:'btn gold',onclick:()=>{
     try{ downloadRosterJson(); }
     catch(e){ toast('Download failed: '+e.message,'err'); }
@@ -5311,22 +5404,41 @@ function adminSettings(main){
   backupCard.appendChild(dataInfo);
   main.appendChild(backupCard);
 
-  // ── General settings ────────────────────────────────────────
+  // ── LOCAL section header ───────────────────────────────────────
+  const localHeader = el('div',{class:'card',style:{background:'var(--yellow-soft)'}});
+  localHeader.appendChild(el('h2',null,'Local settings (this browser only)'));
+  localHeader.appendChild(el('div',{class:'note'},
+    'These settings are saved in this browser/device only (localStorage). They ',
+    el('strong',null,'do not'),
+    ' publish to GitHub or affect any other user. Each device manages its own copy.'));
+  main.appendChild(localHeader);
+
+  // ── General (local) settings ───────────────────────────────
   const card = el('div',{class:'card'});
   card.appendChild(el('h2',null,'General settings'));
-  const pw = el('input',{type:'text', value: State.settings.passcode || DEFAULT_PASSCODE});
+  // SECURITY: do NOT pre-fill the coordinator passcode value — exposing the
+  // current passcode in plain text in a regular input was a credential leak
+  // for anyone who could see this screen. Leave the field blank; saving with
+  // an empty field keeps the existing passcode untouched.
+  const pw = el('input',{type:'password', value:'', autocomplete:'new-password',
+    placeholder:'Enter a new coordinator passcode (leave blank to keep current)'});
   const coordEmail = el('input',{type:'email', value: State.settings.coordinatorEmail || 'clinicaltutorsyear2@sgu.edu'});
   card.appendChild(el('label',null,
     el('div',{class:'muted',style:{fontSize:'.85rem',marginBottom:'.2rem'}},'Coordinator passcode'),
     pw));
+  card.appendChild(el('div',{class:'note warn',style:{fontSize:'.8rem',marginTop:'.3rem'}},
+    'Saved to this browser only. The change does ', el('strong',null,'not'),
+    ' propagate to GitHub Pages or to other users automatically — there is no auto-publish mechanism for passwords.'));
   card.appendChild(el('label',null,
     el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.6rem',marginBottom:'.2rem'}},'Leave request email address'),
     coordEmail));
   card.appendChild(el('div',{style:{marginTop:'.7rem'}}));
   card.appendChild(el('button',{class:'btn',onclick:async()=>{
-    State.settings.passcode = pw.value.trim() || DEFAULT_PASSCODE;
+    const v = pw.value.trim();
+    if(v) State.settings.passcode = v;
     State.settings.coordinatorEmail = coordEmail.value.trim() || 'clinicaltutorsyear2@sgu.edu';
-    await persist(); toast('Settings saved','ok');
+    await persist(); toast('Settings saved (local to this browser)','ok');
+    pw.value = '';
   }},'Save settings'));
   main.appendChild(card);
 
@@ -5490,6 +5602,65 @@ function absenceDaysForInstructor(id){
     }
   }
   return { total, excused, unexcused };
+}
+
+// Map a raw attendance-status string from the "Review session attendance"
+// worksheet into one of: 'present' | 'absent_with' | 'absent_without' | 'other'.
+//   "Email absent", "E.Absent", "Excused", "LOA" → with notification
+//   "Absent", "Internet Issue"                   → without notification
+//   "Present", "Late"                            → present (counted separately)
+//   anything else (e.g. session-name cells)      → other / not an absence
+function classifyReviewAttendance(rawStatus){
+  const s = (rawStatus||'').toLowerCase().trim();
+  if(!s) return 'other';
+  if(/^present\b/.test(s)) return 'present';
+  if(/^late\b/.test(s) && !s.includes('absent')) return 'present';
+  if(/email\s*absent|e\.\s*absent|excused|loa\b|on\s*leave/.test(s)) return 'absent_with';
+  if(/^absent\b|internet\s*issue|tec(h(\.|nical))?\s*failure/.test(s)) return 'absent_without';
+  return 'other';
+}
+
+// Per-instructor review-session attendance summary, built from the
+// `Review session attendance` worksheet via review_attendance records.
+function reviewAttendanceForInstructor(id){
+  const records = [];
+  for(const a of (State.data.review_attendance||[])){
+    if(a.instructor_id !== id) continue;
+    if(!a.attendance_status) continue;        // skip auto-derived stubs
+    const rev = (State.data.review_sessions||[]).find(r => r.review_id === a.review_id) || {};
+    records.push({
+      review_id: a.review_id,
+      attendance_status: a.attendance_status,
+      bucket: classifyReviewAttendance(a.attendance_status),
+      review_date: rev.review_date || '',
+      review_start_time: rev.review_start_time || '',
+      course: rev.course || '',
+      module: rev.module || '',
+      sg_code: rev.sg_code || '',
+      discipline: rev.discipline || '',
+      activity_name: rev.activity_name || rev.sg_code || rev.discipline || '',
+      review_location: rev.review_location || '',
+    });
+  }
+  records.sort((x,y) =>
+    (x.review_date||'').localeCompare(y.review_date||'') ||
+    (x.review_start_time||'').localeCompare(y.review_start_time||'')
+  );
+  let absent_with = 0, absent_without = 0, present = 0, other = 0;
+  const detailsWith = [], detailsWithout = [];
+  for(const r of records){
+    if(r.bucket === 'absent_with'){ absent_with++; detailsWith.push(r); }
+    else if(r.bucket === 'absent_without'){ absent_without++; detailsWithout.push(r); }
+    else if(r.bucket === 'present'){ present++; }
+    else { other++; }
+  }
+  return {
+    total_absent: absent_with + absent_without,
+    absent_with, absent_without,
+    present, other,
+    records, detailsWith, detailsWithout,
+    has_data: records.length > 0,
+  };
 }
 function buildAttendanceReport(){
   return State.data.instructors.map(i => {
@@ -5773,6 +5944,104 @@ function parseWorkbook(wb){
     }
   }
 
+  // 6c. Review session attendance — the worksheet records actual per-session
+  // attendance status (Present / Absent / Email absent / Excused / LOA / Late /
+  // Internet Issue, …) in a wide instructor × session grid.  Layout observed:
+  //   row 4 (0-indexed): date per column, forward-filled across the merged block
+  //   row 5: time per column
+  //   row 8+: instructor rows — col 0 = SGU email, col 4 = full name,
+  //           col 5..7 = summary counters (Late / Total Absences / Total E.Absences),
+  //           col 8..N = attendance status per session column.
+  // We materialise each non-empty status cell as a review_attendance record with
+  // an `attendance_status` field; the dept-chair and instructor profile views
+  // consume this to count "Absent with email/notification" vs "Absent without".
+  for(const sn of sheets){
+    if(!/^review session attendance$/i.test(sn)) continue;
+    const ws = wb.Sheets[sn];
+    const rows = sheetToRows(ws);
+    if(!rows.length) continue;
+    const DATE_ROW = 4, TIME_ROW = 5, FIRST_INST_ROW = 8;
+    const EMAIL_COL = 0, NAME_COL = 4, FIRST_STATUS_COL = 8;
+    const dateRow = rows[DATE_ROW] || [];
+    const timeRow = rows[TIME_ROW] || [];
+    const ncols = Math.max(
+      dateRow.length, timeRow.length,
+      ...rows.slice(FIRST_INST_ROW).map(r => (r||[]).length)
+    );
+    // Forward-fill the date row so every status column has a date.
+    const colDate = new Array(ncols).fill('');
+    const colTime = new Array(ncols).fill('');
+    let lastDate = '';
+    for(let c=0;c<ncols;c++){
+      const parsedD = cellToISO(ws, DATE_ROW, c, dateRow[c]);
+      if(parsedD && /^\d{4}-\d{2}-\d{2}/.test(parsedD)) lastDate = parsedD.slice(0,10);
+      colDate[c] = lastDate;
+      colTime[c] = cellToTime(ws, TIME_ROW, c, timeRow[c]) || '';
+    }
+    // Index existing review_sessions for fast match.
+    const revByDateTime = {};
+    const revByDate = {};
+    for(const r of data.review_sessions){
+      if(!r.review_date) continue;
+      revByDateTime[r.review_date+'|'+(r.review_start_time||'')] = r;
+      (revByDate[r.review_date] = revByDate[r.review_date] || []).push(r);
+    }
+    for(let i=FIRST_INST_ROW;i<rows.length;i++){
+      const row = rows[i]||[];
+      const email = vstr(row[EMAIL_COL]);
+      const name  = vstr(row[NAME_COL]);
+      if(!email && !name) continue;
+      if(/^\d+$/.test(email) && !name) continue;
+      // Resolve to (or create) an instructor record. addInstructor merges by
+      // email/name, so the same iid is returned regardless of which identifier
+      // is most reliable.
+      const iid = addInstructor(name || email, email, '', '', sn);
+      if(!iid) continue;
+      for(let c=FIRST_STATUS_COL;c<ncols;c++){
+        const cell = row[c];
+        if(cell == null || cell === '') continue;
+        const sv = vstr(cell);
+        if(!sv) continue;
+        // Skip empty placeholders & numeric summary cells.
+        if(sv === '0' || /^\d+(?:\.\d+)?$/.test(sv)) continue;
+        const d = colDate[c]; if(!d) continue;
+        const t = colTime[c] || '';
+        // Match to a review session: exact (date,time) first, else any review
+        // session on that date.  Falling back to a synthesised session keeps
+        // attendance visible even when the timetable sheet is incomplete.
+        let rev = revByDateTime[d+'|'+t];
+        if(!rev){
+          const list = revByDate[d] || [];
+          rev = list[0];
+        }
+        let reviewId;
+        if(rev){
+          reviewId = rev.review_id;
+        } else {
+          reviewId = newId('rev', d, t, 'attendance');
+          const synth = {
+            review_id: reviewId, course:'', module:'',
+            review_date: d, review_start_time: t, review_end_time: '',
+            duration:'', sg_code:'', discipline:'',
+            review_location:'', zoom_link:'', meeting_id:'', passcode:'', notes:'',
+            linked_activity_id:'',
+            activity_name: 'Review session '+d+(t?' '+t:''),
+            from_attendance_sheet: true,
+          };
+          data.review_sessions.push(synth);
+          revByDateTime[d+'|'+t] = synth;
+          (revByDate[d] = revByDate[d] || []).push(synth);
+        }
+        data.review_attendance.push({
+          review_id: reviewId, instructor_id: iid,
+          attendance_required: true, attendance_confirmed: null,
+          attendance_status: sv,
+          source: 'attendance-sheet', coordinator_note: '',
+        });
+      }
+    }
+  }
+
   // 6b. Month grids (April / May / June / etc.) — wide instructor×session matrix
   // Recognised month-grid sheets — any tab whose name is a month name is parsed automatically.
   const MONTH_NAMES = new Set(['january','february','march','april','may','june','july','august','september','october','november','december']);
@@ -5933,15 +6202,28 @@ function parseWorkbook(wb){
     );
     if(found) r.linked_activity_id = found.activity_id;
   }
-  // 7b. Auto-derive review attendance from linked SG assignments
-  for(const r of data.review_sessions){
-    if(!r.linked_activity_id) continue;
-    const sgInsts = new Set(data.assignments.filter(a => a.activity_id === r.linked_activity_id && a.is_active !== false).map(a => a.instructor_id));
-    sgInsts.forEach(iid => data.review_attendance.push({
-      review_id: r.review_id, instructor_id: iid,
-      attendance_required: true, attendance_confirmed: null,
-      source: 'auto-derived', coordinator_note: '',
-    }));
+  // 7b. Auto-derive review attendance from linked SG assignments — but only
+  // for (review_id, instructor_id) pairs that aren't already present from the
+  // attendance worksheet, otherwise the real Present/Absent/Excused status
+  // would be diluted by stub auto-derived records.
+  {
+    const seen = new Set(
+      data.review_attendance.map(a => (a.review_id||'')+'|'+(a.instructor_id||''))
+    );
+    for(const r of data.review_sessions){
+      if(!r.linked_activity_id) continue;
+      const sgInsts = new Set(data.assignments.filter(a => a.activity_id === r.linked_activity_id && a.is_active !== false).map(a => a.instructor_id));
+      sgInsts.forEach(iid => {
+        const k = r.review_id+'|'+iid;
+        if(seen.has(k)) return;
+        seen.add(k);
+        data.review_attendance.push({
+          review_id: r.review_id, instructor_id: iid,
+          attendance_required: true, attendance_confirmed: null,
+          source: 'auto-derived', coordinator_note: '',
+        });
+      });
+    }
   }
 
   data.instructors = Object.values(instById);
