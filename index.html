@@ -974,80 +974,168 @@ function assignmentsForInstructor(instructorId){
   return State.data.assignments.filter(a => a.instructor_id === instructorId);
 }
 
-// Returns the Set of master_schedule activity_ids that should qualify a staff
-// member for the given review session — i.e. every cohort activity of the
-// review's SG, not just the single linked_activity_id.
-//
-// Two roles in one:
-//   - When linked_activity_id is set (current/forward months in published
-//     data), expand it to all cohort siblings (same date, same base activity
-//     name once the trailing "(cohort)" suffix is stripped). This fixes the
-//     bug where an instructor assigned to only one or two cohorts (A/B/C/D)
-//     of an SG was not recognised as responsible for that SG's review.
-//   - When linked_activity_id is empty (historical Jan–March reviews in the
-//     currently-published JSON), resolve the link on the fly from sg_code:
-//     match by name substring first, then fall back to bare "SGn" number
-//     matching with date-proximity ranking. This fixes the bug where review
-//     sessions were only being applied to the current month and forward.
-function findReviewSgActivities(rev){
+/* -------- 3b. SG ↔ REVIEW LINKING --------------------------
+   Small Group activities are split into 4 cohorts (A/B/C/D) which the
+   workbook stores as separate rows: "RHPS SG7 (A)", "RHPS SG7 (B)", …
+   Business rule: anyone assigned to AT LEAST ONE cohort of an SG must
+   be required at that SG's review session — never wait for all four
+   cohorts to be covered.
+
+   The original linking logic kept a single linked_activity_id per
+   review, which (a) silently dropped instructors from non-linked
+   cohorts and (b) left historical Jan–April reviews unlinked because
+   the first-match scan happened to fall on a wrong-month or
+   wrong-cohort activity.
+
+   The fix below routes everything through a normalized SG key
+   ("RHPS SG7"). Every cohort row maps to the same key, every review
+   session resolves to one or more keys (compound reviews like
+   "DNPR SG 2 AND SG 4" split into two), and a single per-data-load
+   index maps key → instructors. Date is intentionally NOT a matching
+   axis: an instructor on cohort A of RHPS SG7 in May 14 is still on
+   the hook for any RHPS SG7 review session in the dataset. */
+
+// Canonical key generator. Strips trailing cohort/parenthetical, strips a
+// trailing "Review Session"/"Review", tightens "SG 7" → "SG7", drops leading
+// zeros from the SG number, collapses whitespace, uppercases.
+//   "RHPS SG7 (A)"            → "RHPS SG7"
+//   "RHPS SG 7"               → "RHPS SG7"
+//   "RHPS SG7 Review Session" → "RHPS SG7"
+//   "SG1 (B)"                 → "SG1"
+function normalizeSgKey(name){
+  if(name == null) return '';
+  let s = String(name).trim();
+  if(!s) return '';
+  s = s.replace(/\s*\([^)]*\)\s*$/, '');
+  s = s.replace(/\s+review(\s+session)?\s*$/i, '');
+  s = s.replace(/\bsg\s*0*(\d+)/gi, 'SG$1');
+  return s.replace(/\s+/g, ' ').trim().toUpperCase();
+}
+
+function getActivitySgKey(activity){
+  if(!activity) return '';
+  return normalizeSgKey(activity.activity_name || '');
+}
+
+// Returns the array of SG keys this review session represents. Most reviews
+// have a single key; compound reviews like "MI SG3 and SG9" or "DNPR SG 2
+// AND SG 4" expand into multiple. The function tries sg_code first, falls
+// back to activity_name, and also folds in linked_activity_id's key (so a
+// review whose sg_code is a generic label — "OSCE", empty — can still be
+// linked via the pre-computed linked_activity_id).
+function getReviewSgKeys(review, dataset){
+  if(!review) return [];
+  const ms = (dataset || State.data || {}).master_schedule || [];
   const out = new Set();
-  if(!rev) return out;
-  const ms = State.data.master_schedule || [];
-  const baseName = (n) => String(n||'').toLowerCase().replace(/\s*\([^)]*\)\s*$/,'').trim();
-  const sgNumOf  = (s) => { const m = String(s||'').toLowerCase().match(/sg\s*0*(\d+)/); return m ? m[1] : ''; };
-  // Case 1: explicit link present — expand to cohort siblings.
-  const linked = rev.linked_activity_id ? ms.find(a => a.activity_id === rev.linked_activity_id) : null;
-  if(linked){
-    const targetBase = baseName(linked.activity_name);
-    for(const a of ms){
-      if(!isSGActivity(a)) continue;
-      if(a.date !== linked.date) continue;
-      if(baseName(a.activity_name) !== targetBase) continue;
-      out.add(a.activity_id);
+  function expand(raw){
+    if(!raw) return;
+    let s = String(raw).trim();
+    if(!s) return;
+    s = s.replace(/\s*\([^)]*\)\s*$/, '');
+    s = s.replace(/\s+review(\s+session)?\s*$/i, '');
+    const sgMatches = [...s.matchAll(/\bsg\s*0*(\d+)/gi)];
+    if(sgMatches.length <= 1){
+      const k = normalizeSgKey(s);
+      if(k) out.add(k);
+      return;
     }
-    if(out.size) return out;
+    // Compound: text before the first SG match is the module prefix.
+    const prefix = s.slice(0, sgMatches[0].index).trim();
+    for(const m of sgMatches) out.add(normalizeSgKey(prefix + ' SG' + m[1]));
   }
-  // Case 2: no link — resolve from sg_code with date-proximity preference.
-  const sgRaw  = String(rev.sg_code||'').toLowerCase();
-  const sgNorm = sgRaw.replace(/\s+/g,'').replace('sg','');
-  if(!sgNorm) return out;
-  const sgNum = sgNumOf(rev.sg_code);
-  const candidates = ms.filter(a => {
-    if(!isSGActivity(a)) return false;
-    const an = String(a.activity_name||'').toLowerCase().replace(/\s+/g,'').replace('sg','');
-    if(an && (an.includes(sgNorm) || sgNorm.includes(an))) return true;
-    // Fallback: bare "SGn" activities (no module prefix, as used Jan–Feb)
-    // match a prefixed review sg_code like "MNI SG1" by their SG number.
-    if(sgNum && sgNumOf(a.activity_name) === sgNum) return true;
-    return false;
-  });
-  if(!candidates.length) return out;
-  if(rev.review_date){
-    const rt = new Date(rev.review_date).getTime();
-    candidates.sort((a,b) => {
-      const ta = a.date ? new Date(a.date).getTime() : 0;
-      const tb = b.date ? new Date(b.date).getTime() : 0;
-      return Math.abs(ta - rt) - Math.abs(tb - rt);
-    });
+  expand(review.sg_code);
+  if(!out.size) expand(review.activity_name);
+  if(review.linked_activity_id){
+    const a = ms.find(x => x.activity_id === review.linked_activity_id);
+    if(a){
+      const k = getActivitySgKey(a);
+      if(k) out.add(k);
+    }
   }
-  // Lock onto the closest match's date + base name, then collect every cohort
-  // sibling sharing that (date, base name) so partial-cohort assignments still
-  // qualify.
-  const best = candidates[0];
-  const targetBase = baseName(best.activity_name);
-  for(const a of candidates){
-    if(a.date === best.date && baseName(a.activity_name) === targetBase){
-      out.add(a.activity_id);
+  return [...out];
+}
+
+// All SG activity rows (any date, any cohort) that share the given key.
+function getCohortSiblingActivities(keyOrActivity, dataset){
+  let key = '';
+  if(typeof keyOrActivity === 'string') key = normalizeSgKey(keyOrActivity);
+  else if(keyOrActivity) key = getActivitySgKey(keyOrActivity);
+  if(!key) return [];
+  const ms = (dataset || State.data || {}).master_schedule || [];
+  const out = [];
+  for(const a of ms){
+    if(!isSGActivity(a)) continue;
+    if(getActivitySgKey(a) === key) out.push(a);
+  }
+  return out;
+}
+
+// Pre-computed Map<sgKey, Set<instructor_id>> over State.data — built lazily,
+// invalidated automatically when State.data is replaced (cache lives on the
+// data object itself as a non-enumerable field, so a fresh data load starts
+// with an empty cache). Two key strata are stored:
+//   - exact keys      ("RHPS SG7", "MI SG1")
+//   - bare "*SGn"     aliases     — emitted only by activities whose own key
+//                                   is bare ("SG1"), so prefixed review keys
+//                                   like "MNI SG1" still hit Jan-style rows.
+function _sgKeyToInstructorIndex(){
+  const d = State.data;
+  if(!d) return new Map();
+  if(d._sgKeyInstructorIndex) return d._sgKeyInstructorIndex;
+  const activityKey = new Map();
+  for(const a of d.master_schedule||[]){
+    if(!isSGActivity(a)) continue;
+    const k = getActivitySgKey(a);
+    if(k) activityKey.set(a.activity_id, k);
+  }
+  const idx = new Map();
+  for(const asgn of d.assignments||[]){
+    if(asgn.is_active === false) continue;
+    const k = activityKey.get(asgn.activity_id);
+    if(!k) continue;
+    if(!idx.has(k)) idx.set(k, new Set());
+    idx.get(k).add(asgn.instructor_id);
+    const bare = k.match(/^SG(\d+)$/);
+    if(bare){
+      const alias = '*SG' + bare[1];
+      if(!idx.has(alias)) idx.set(alias, new Set());
+      idx.get(alias).add(asgn.instructor_id);
+    }
+  }
+  try{
+    Object.defineProperty(d, '_sgKeyInstructorIndex', { value: idx, configurable: true, enumerable: false });
+  }catch(e){ d._sgKeyInstructorIndex = idx; }
+  return idx;
+}
+
+// The Set of instructor_ids required at a given review session. "Required"
+// means assigned to AT LEAST ONE cohort (A/B/C/D) of the review's parent SG.
+function getRequiredReviewInstructors(review){
+  const out = new Set();
+  if(!review) return out;
+  const keys = getReviewSgKeys(review);
+  if(!keys.length) return out;
+  const idx = _sgKeyToInstructorIndex();
+  for(const k of keys){
+    const direct = idx.get(k);
+    if(direct) direct.forEach(id => out.add(id));
+    // Prefixed review key ("MNI SG1") also matches bare "*SG1" alias so
+    // Jan/Feb workbook rows that lack a module prefix still qualify.
+    const m = k.match(/SG(\d+)$/);
+    if(m){
+      const alias = idx.get('*SG' + m[1]);
+      if(alias) alias.forEach(id => out.add(id));
     }
   }
   return out;
 }
 
 function reviewsForInstructor(instructorId){
-  // Method A: via review_attendance table (auto-derived during parsing)
   const seenIds = new Set();
   const results = [];
-  State.data.review_attendance
+  // Method A — explicit per-row records (Present/Absent/E.Absent/etc. lifted
+  // from the "Review session attendance" worksheet).
+  (State.data.review_attendance||[])
     .filter(a => a.instructor_id === instructorId)
     .forEach(a => {
       const rev = reviewById(a.review_id);
@@ -1056,28 +1144,15 @@ function reviewsForInstructor(instructorId){
         results.push(Object.assign({}, rev, { _attendance: a }));
       }
     });
-  // Method B: direct activity→review link — catches cases where the string-match
-  // linking succeeded but review_attendance wasn't populated (e.g. re-imports).
-  // Matches against every cohort activity of the review's SG (not just the
-  // single linked_activity_id) so any partial cohort assignment qualifies, and
-  // falls back to on-the-fly resolution from sg_code so historical reviews
-  // whose link is empty in the published JSON are still surfaced.
-  const myActivityIds = new Set(
-    (State.data.assignments||[])
-      .filter(a => a.instructor_id === instructorId && a.is_active !== false)
-      .map(a => a.activity_id)
-  );
-  (State.data.review_sessions||[]).forEach(rev => {
-    if(seenIds.has(rev.review_id)) return;
-    const sgActIds = findReviewSgActivities(rev);
-    for(const aid of sgActIds){
-      if(myActivityIds.has(aid)){
-        seenIds.add(rev.review_id);
-        results.push(Object.assign({}, rev, { _attendance: null }));
-        return;
-      }
+  // Method B — derived from SG-cohort assignments. Any instructor assigned to
+  // even one cohort of the review's parent SG is treated as required.
+  for(const rev of (State.data.review_sessions||[])){
+    if(seenIds.has(rev.review_id)) continue;
+    if(getRequiredReviewInstructors(rev).has(instructorId)){
+      seenIds.add(rev.review_id);
+      results.push(Object.assign({}, rev, { _attendance: null }));
     }
-  });
+  }
   return results;
 }
 
@@ -3483,6 +3558,131 @@ function showInstructorAbsenceModal(r){
 
 function adminCleaning(main){
   const issues = detectAllIssues();
+
+  // ── Review Session Linking Audit ──────────────────────────────
+  // Coordinator diagnostic: per review session, show the normalized SG key,
+  // every cohort activity that maps to it (A/B/C/D rows + dates), the
+  // instructors assigned to each cohort, and the final derived list of
+  // required instructors. Highlights reviews that don't resolve to any SG
+  // activity so naming mismatches surface immediately.
+  (function buildLinkingAudit(){
+    const card = el('div',{class:'card'});
+    card.appendChild(el('h2',null,'Review Session Linking Audit'));
+    card.appendChild(el('div',{class:'note'},
+      'For each review session: parent SG key, matched cohort activities, ' +
+      'and the instructors derived as required. Anyone assigned to at least ' +
+      'one cohort is required — full A/B/C/D coverage is not necessary.'));
+
+    const filterRow = el('div',{class:'cluster',style:{marginTop:'.5rem',gap:'.4rem',alignItems:'center',flexWrap:'wrap'}});
+    const search = el('input',{type:'search',placeholder:'Filter by review name, SG key, instructor…',style:{minWidth:'220px',flex:'1'}});
+    const onlyUnresolved = el('input',{type:'checkbox'});
+    filterRow.appendChild(search);
+    filterRow.appendChild(el('label',{style:{display:'flex',alignItems:'center',gap:'.3rem',fontSize:'.88rem'}},
+      onlyUnresolved, el('span',null,'Only show unresolved')));
+    card.appendChild(filterRow);
+
+    const summary = el('div',{class:'muted',style:{margin:'.4rem 0',fontSize:'.85rem'}});
+    card.appendChild(summary);
+
+    const list = el('div',{class:'list',style:{marginTop:'.4rem'}});
+    card.appendChild(list);
+
+    // Pre-compute one row per review session.
+    const rows = (State.data.review_sessions||[]).map(rev => {
+      const keys = getReviewSgKeys(rev);
+      const cohortsByKey = {};
+      for(const k of keys){
+        cohortsByKey[k] = getCohortSiblingActivities(k);
+        // Bare-SGn alias — pull in SG-number-only activities for prefixed keys
+        const m = k.match(/SG(\d+)$/);
+        if(m){
+          const extra = getCohortSiblingActivities('SG'+m[1]);
+          if(extra.length){
+            const seen = new Set(cohortsByKey[k].map(a => a.activity_id));
+            for(const a of extra) if(!seen.has(a.activity_id)) cohortsByKey[k].push(a);
+          }
+        }
+      }
+      const required = getRequiredReviewInstructors(rev);
+      return { rev, keys, cohortsByKey, required };
+    });
+
+    function inststr(ids){
+      return [...ids].map(id => (instructorById(id)||{}).full_name || id).sort().join(', ');
+    }
+
+    function render(){
+      clear(list);
+      const q = (search.value||'').trim().toLowerCase();
+      const only = onlyUnresolved.checked;
+      let shown = 0;
+      let unresolvedTotal = 0;
+      for(const r of rows){
+        const totalActs = Object.values(r.cohortsByKey).reduce((n, arr) => n + arr.length, 0);
+        const unresolved = !r.keys.length || totalActs === 0;
+        if(unresolved) unresolvedTotal++;
+        if(only && !unresolved) continue;
+        // Filter by search query
+        if(q){
+          const blob = [
+            r.rev.sg_code, r.rev.activity_name, r.rev.review_date,
+            r.keys.join(' '),
+            inststr(r.required),
+          ].join(' ').toLowerCase();
+          if(!blob.includes(q)) continue;
+        }
+        shown++;
+        const item = el('div',{class:'item status-'+(unresolved?'warn':'ok')});
+        const title = (r.rev.sg_code || r.rev.activity_name || '(unnamed review)') +
+          ' — ' + (r.rev.review_date ? fmtDate(r.rev.review_date) : 'no date');
+        item.appendChild(el('div',{class:'item-head'},
+          el('div',{class:'item-title'}, title),
+          el('span',{class:'badge '+(unresolved?'yellow':'green')},
+            unresolved ? 'No SG match' : (r.required.size + ' required'))
+        ));
+        item.appendChild(el('div',{class:'meta'},
+          el('span',null,'Parent SG key(s): ' + (r.keys.length ? r.keys.join(' · ') : '—'))
+        ));
+        if(!unresolved){
+          // Per-cohort breakdown
+          for(const k of r.keys){
+            const acts = r.cohortsByKey[k] || [];
+            if(!acts.length) continue;
+            const head = el('div',{class:'muted',style:{fontSize:'.85rem',marginTop:'.3rem'}}, 'Cohorts under ' + k + ':');
+            item.appendChild(head);
+            const sub = el('ul',{style:{margin:'.15rem 0 .15rem 1.1rem',padding:0,fontSize:'.85rem'}});
+            for(const a of acts){
+              const assignedHere = (State.data.assignments||[])
+                .filter(x => x.activity_id === a.activity_id && x.is_active !== false)
+                .map(x => (instructorById(x.instructor_id)||{}).full_name || x.instructor_id);
+              const label = (a.activity_name||'?') + (a.date?' · '+fmtDate(a.date):'') +
+                ' — ' + (assignedHere.length ? assignedHere.sort().join(', ') : 'no active assignees');
+              sub.appendChild(el('li',null,label));
+            }
+            item.appendChild(sub);
+          }
+          item.appendChild(el('div',{class:'muted',style:{marginTop:'.35rem',fontSize:'.85rem'}},
+            'Final required (any cohort): ' + (r.required.size ? inststr(r.required) : '—')));
+        } else {
+          item.appendChild(el('div',{class:'note warn',style:{marginTop:'.3rem'}},
+            'No SG activity matched this review session\'s key. ' +
+            'Check that sg_code/activity_name in the review row matches the ' +
+            'naming used in the month-grid worksheet (case- and space-insensitive).'));
+        }
+        list.appendChild(item);
+      }
+      summary.textContent =
+        rows.length + ' review session(s) total · ' +
+        unresolvedTotal + ' unresolved · ' +
+        shown + ' shown' + (q ? ' (filter: "'+q+'")' : '');
+      if(!shown) list.appendChild(el('div',{class:'empty'},'No reviews match the current filter.'));
+    }
+    search.addEventListener('input', debounce(render, 120));
+    onlyUnresolved.addEventListener('change', render);
+    render();
+    main.appendChild(card);
+  })();
+
   // Duplicates
   const card1 = el('div',{class:'card'});
   card1.appendChild(el('h2',null,'Possible duplicate instructor names'));
@@ -5603,33 +5803,38 @@ function detectOutsideHours(){
   return out.filter(x => !State.overrides['hours|'+x.instructor_id+'|'+x.activity_id]);
 }
 function detectSgWithoutReview(){
-  const linkedActIds = new Set(State.data.review_sessions.map(r => r.linked_activity_id).filter(Boolean));
-  return State.data.master_schedule
-    .filter(isSGActivity)
-    .filter(a => !linkedActIds.has(a.activity_id))
+  // SG activity is "without review" iff its SG key is not claimed by any
+  // review session. Cohort siblings share a key, so flagging only the
+  // unclaimed parent SG (not every individual cohort) is the right grain.
+  const claimedKeys = new Set();
+  for(const r of (State.data.review_sessions||[])){
+    for(const k of getReviewSgKeys(r)) claimedKeys.add(k);
+  }
+  return (State.data.master_schedule||[])
+    .filter(a => isSGActivity(a) && !claimedKeys.has(getActivitySgKey(a)))
     .filter(a => !State.overrides['sgnorev|'+a.activity_id]);
 }
 function detectReviewWithoutSg(){
-  return State.data.review_sessions
-    .filter(r => !r.linked_activity_id)
+  // Review session is "without SG" iff none of its derived keys resolve to
+  // any SG activity in the dataset.
+  return (State.data.review_sessions||[])
+    .filter(r => {
+      const keys = getReviewSgKeys(r);
+      if(!keys.length) return true;
+      return !keys.some(k => getCohortSiblingActivities(k).length > 0);
+    })
     .filter(r => !State.overrides['revnosg|'+r.review_id]);
 }
 function detectSgMissingReview(){
   const out = [];
-  for(const r of State.data.review_sessions){
-    // Expand to all cohort activities of the review's SG so partial-cohort
-    // assignments are evaluated as legitimately responsible for the review.
-    const sgActIds = findReviewSgActivities(r);
-    if(!sgActIds.size) continue;
-    const sgInstructors = new Set(
-      State.data.assignments
-        .filter(a => sgActIds.has(a.activity_id) && a.is_active !== false)
-        .map(a => a.instructor_id)
-    );
-    const reviewInstructors = new Set(State.data.review_attendance.filter(x => x.review_id === r.review_id).map(x => x.instructor_id));
-    sgInstructors.forEach(iid => {
-      if(!reviewInstructors.has(iid)){
-        out.push({instructor_id:iid, activity_id:r.linked_activity_id||[...sgActIds][0], review_id:r.review_id});
+  for(const r of (State.data.review_sessions||[])){
+    const required = getRequiredReviewInstructors(r);
+    if(!required.size) continue;
+    const present = new Set((State.data.review_attendance||[])
+      .filter(x => x.review_id === r.review_id).map(x => x.instructor_id));
+    required.forEach(iid => {
+      if(!present.has(iid)){
+        out.push({instructor_id:iid, activity_id:r.linked_activity_id||'', review_id:r.review_id});
       }
     });
   }
@@ -5637,16 +5842,11 @@ function detectSgMissingReview(){
 }
 function detectReviewNotOnSg(){
   const out = [];
-  for(const r of State.data.review_sessions){
-    const sgActIds = findReviewSgActivities(r);
-    if(!sgActIds.size) continue;
-    const sgSet = new Set(
-      State.data.assignments
-        .filter(a => sgActIds.has(a.activity_id) && a.is_active !== false)
-        .map(a => a.instructor_id)
-    );
-    State.data.review_attendance.filter(x => x.review_id === r.review_id).forEach(x => {
-      if(!sgSet.has(x.instructor_id)) out.push({instructor_id:x.instructor_id, review_id:r.review_id});
+  for(const r of (State.data.review_sessions||[])){
+    const required = getRequiredReviewInstructors(r);
+    if(!required.size) continue;
+    (State.data.review_attendance||[]).filter(x => x.review_id === r.review_id).forEach(x => {
+      if(!required.has(x.instructor_id)) out.push({instructor_id:x.instructor_id, review_id:r.review_id});
     });
   }
   return out.filter(x => !State.overrides['revnotsg|'+x.instructor_id+'|'+x.review_id]);
@@ -6283,69 +6483,95 @@ function parseWorkbook(wb){
     }
   }
 
-  // 7. Link reviews to activities by SG code.
-  // Match by name first; fall back to bare "SGn" number matching so months
-  // whose SG activities lack a module prefix (e.g. "SG1 (A)" in Jan/Feb) still
-  // link to prefixed review sg_codes like "MNI SG1". Then pick the candidate
-  // closest to the review_date so cross-month false-matches are avoided —
-  // without this the runtime "first match wins" behaviour was leaving every
-  // Jan–April review unlinked, which in turn skipped auto-derived attendance
-  // for the entire historical roster period.
-  const _baseName = (n) => String(n||'').toLowerCase().replace(/\s*\([^)]*\)\s*$/,'').trim();
-  const _sgNumOf  = (s) => { const m = String(s||'').toLowerCase().match(/sg\s*0*(\d+)/); return m ? m[1] : ''; };
-  for(const r of data.review_sessions){
-    const sgRaw  = (r.sg_code||'').toLowerCase();
-    const sgNorm = sgRaw.replace(/\s+/g,'').replace('sg','');
-    if(!sgNorm) continue;
-    const sgNum = _sgNumOf(r.sg_code);
-    const candidates = data.master_schedule.filter(a => {
-      if(!isSGActivity(a)) return false;
-      const an = (a.activity_name||'').toLowerCase().replace(/\s+/g,'').replace('sg','');
-      if(an && (an.includes(sgNorm) || sgNorm.includes(an))) return true;
-      if(sgNum && _sgNumOf(a.activity_name) === sgNum) return true;
-      return false;
-    });
-    if(!candidates.length) continue;
-    if(r.review_date && candidates.length > 1){
-      const rt = new Date(r.review_date).getTime();
-      candidates.sort((a,b) => {
-        const ta = a.date ? new Date(a.date).getTime() : 0;
-        const tb = b.date ? new Date(b.date).getTime() : 0;
-        return Math.abs(ta - rt) - Math.abs(tb - rt);
-      });
-    }
-    r.linked_activity_id = candidates[0].activity_id;
-  }
-  // 7b. Auto-derive review attendance from linked SG assignments — but only
-  // for (review_id, instructor_id) pairs that aren't already present from the
-  // attendance worksheet, otherwise the real Present/Absent/Excused status
-  // would be diluted by stub auto-derived records.
+  // 7. Link reviews to activities by SG key.
   //
-  // Walks every cohort sibling (same date, same base activity_name) of the
-  // linked activity so that an instructor assigned to only one or two cohorts
-  // of an SG is still recognised as responsible for that SG's review session.
+  // Routes through the same normalizeSgKey + getReviewSgKeys helpers used at
+  // runtime so the result is symmetric: every cohort row (A/B/C/D) of an SG
+  // maps to one parent key, and a review session's compound sg_code (e.g.
+  // "DNPR SG 2 AND SG 4") expands into one key per SG number. The linked
+  // activity is now chosen on the same date as the review when one exists,
+  // otherwise the date-closest match wins — never a wrong-cohort or
+  // wrong-module first-substring-hit like the original logic.
+  const _actKeys = new Map();
+  for(const a of data.master_schedule){
+    if(!isSGActivity(a)) continue;
+    const k = normalizeSgKey(a.activity_name||'');
+    if(!k) continue;
+    if(!_actKeys.has(k)) _actKeys.set(k, []);
+    _actKeys.get(k).push(a);
+  }
+  for(const r of data.review_sessions){
+    const keys = getReviewSgKeys(r, data);
+    let pool = [];
+    for(const k of keys){
+      if(_actKeys.has(k)) pool = pool.concat(_actKeys.get(k));
+      // Prefixed review key "MNI SG1" also matches bare "SG1" activities so
+      // Jan/Feb workbook rows without a module prefix still link cleanly.
+      const m = k.match(/SG(\d+)$/);
+      if(m && _actKeys.has('SG'+m[1])) pool = pool.concat(_actKeys.get('SG'+m[1]));
+    }
+    if(!pool.length) continue;
+    let pick = null;
+    if(r.review_date){
+      const sameDate = pool.filter(a => a.date === r.review_date);
+      if(sameDate.length){
+        pick = sameDate[0];
+      } else {
+        const rt = new Date(r.review_date).getTime();
+        pick = pool.slice().sort((a,b) => {
+          const ta = a.date ? new Date(a.date).getTime() : 0;
+          const tb = b.date ? new Date(b.date).getTime() : 0;
+          return Math.abs(ta - rt) - Math.abs(tb - rt);
+        })[0];
+      }
+    } else {
+      pick = pool[0];
+    }
+    if(pick) r.linked_activity_id = pick.activity_id;
+  }
+  // 7b. Auto-derive review attendance from SG-cohort assignments. Anyone on
+  // at least one cohort of the review's SG (any A/B/C/D row, any date) is
+  // recorded as required — only when the worksheet hasn't already provided
+  // a real Present/Absent/Excused status for the (review, instructor) pair,
+  // so genuine attendance data is never overwritten by auto-derived stubs.
   {
     const seen = new Set(
       data.review_attendance.map(a => (a.review_id||'')+'|'+(a.instructor_id||''))
     );
+    // Build SG-key → Set<instructor_id> index over THIS dataset (mirrors the
+    // runtime _sgKeyToInstructorIndex but local-scoped to the parser).
+    const keyToInsts = new Map();
+    for(const asgn of data.assignments){
+      if(asgn.is_active === false) continue;
+      const a = data.master_schedule.find(x => x.activity_id === asgn.activity_id);
+      if(!a || !isSGActivity(a)) continue;
+      const k = normalizeSgKey(a.activity_name||'');
+      if(!k) continue;
+      if(!keyToInsts.has(k)) keyToInsts.set(k, new Set());
+      keyToInsts.get(k).add(asgn.instructor_id);
+    }
+    // Materialise the bare-SGn alias so prefixed review keys reach unprefixed activities.
+    for(const [k, ids] of keyToInsts){
+      const m = k.match(/^SG(\d+)$/);
+      if(!m) continue;
+      const alias = '*SG' + m[1];
+      if(!keyToInsts.has(alias)) keyToInsts.set(alias, new Set());
+      for(const id of ids) keyToInsts.get(alias).add(id);
+    }
     for(const r of data.review_sessions){
-      if(!r.linked_activity_id) continue;
-      const linkedAct = data.master_schedule.find(a => a.activity_id === r.linked_activity_id);
-      if(!linkedAct) continue;
-      const targetBase = _baseName(linkedAct.activity_name);
-      const cohortIds = new Set();
-      for(const a of data.master_schedule){
-        if(isSGActivity(a) && a.date === linkedAct.date && _baseName(a.activity_name) === targetBase){
-          cohortIds.add(a.activity_id);
+      const keys = getReviewSgKeys(r, data);
+      if(!keys.length) continue;
+      const required = new Set();
+      for(const k of keys){
+        const direct = keyToInsts.get(k);
+        if(direct) direct.forEach(id => required.add(id));
+        const m = k.match(/SG(\d+)$/);
+        if(m){
+          const alias = keyToInsts.get('*SG' + m[1]);
+          if(alias) alias.forEach(id => required.add(id));
         }
       }
-      if(!cohortIds.size) cohortIds.add(r.linked_activity_id);
-      const sgInsts = new Set(
-        data.assignments
-          .filter(a => cohortIds.has(a.activity_id) && a.is_active !== false)
-          .map(a => a.instructor_id)
-      );
-      sgInsts.forEach(iid => {
+      required.forEach(iid => {
         const k = r.review_id+'|'+iid;
         if(seen.has(k)) return;
         seen.add(k);
