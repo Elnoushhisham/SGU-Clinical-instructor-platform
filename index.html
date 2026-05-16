@@ -973,6 +973,76 @@ function reviewById(id){ return State.data.review_sessions.find(r => r.review_id
 function assignmentsForInstructor(instructorId){
   return State.data.assignments.filter(a => a.instructor_id === instructorId);
 }
+
+// Returns the Set of master_schedule activity_ids that should qualify a staff
+// member for the given review session — i.e. every cohort activity of the
+// review's SG, not just the single linked_activity_id.
+//
+// Two roles in one:
+//   - When linked_activity_id is set (current/forward months in published
+//     data), expand it to all cohort siblings (same date, same base activity
+//     name once the trailing "(cohort)" suffix is stripped). This fixes the
+//     bug where an instructor assigned to only one or two cohorts (A/B/C/D)
+//     of an SG was not recognised as responsible for that SG's review.
+//   - When linked_activity_id is empty (historical Jan–March reviews in the
+//     currently-published JSON), resolve the link on the fly from sg_code:
+//     match by name substring first, then fall back to bare "SGn" number
+//     matching with date-proximity ranking. This fixes the bug where review
+//     sessions were only being applied to the current month and forward.
+function findReviewSgActivities(rev){
+  const out = new Set();
+  if(!rev) return out;
+  const ms = State.data.master_schedule || [];
+  const baseName = (n) => String(n||'').toLowerCase().replace(/\s*\([^)]*\)\s*$/,'').trim();
+  const sgNumOf  = (s) => { const m = String(s||'').toLowerCase().match(/sg\s*0*(\d+)/); return m ? m[1] : ''; };
+  // Case 1: explicit link present — expand to cohort siblings.
+  const linked = rev.linked_activity_id ? ms.find(a => a.activity_id === rev.linked_activity_id) : null;
+  if(linked){
+    const targetBase = baseName(linked.activity_name);
+    for(const a of ms){
+      if(!isSGActivity(a)) continue;
+      if(a.date !== linked.date) continue;
+      if(baseName(a.activity_name) !== targetBase) continue;
+      out.add(a.activity_id);
+    }
+    if(out.size) return out;
+  }
+  // Case 2: no link — resolve from sg_code with date-proximity preference.
+  const sgRaw  = String(rev.sg_code||'').toLowerCase();
+  const sgNorm = sgRaw.replace(/\s+/g,'').replace('sg','');
+  if(!sgNorm) return out;
+  const sgNum = sgNumOf(rev.sg_code);
+  const candidates = ms.filter(a => {
+    if(!isSGActivity(a)) return false;
+    const an = String(a.activity_name||'').toLowerCase().replace(/\s+/g,'').replace('sg','');
+    if(an && (an.includes(sgNorm) || sgNorm.includes(an))) return true;
+    // Fallback: bare "SGn" activities (no module prefix, as used Jan–Feb)
+    // match a prefixed review sg_code like "MNI SG1" by their SG number.
+    if(sgNum && sgNumOf(a.activity_name) === sgNum) return true;
+    return false;
+  });
+  if(!candidates.length) return out;
+  if(rev.review_date){
+    const rt = new Date(rev.review_date).getTime();
+    candidates.sort((a,b) => {
+      const ta = a.date ? new Date(a.date).getTime() : 0;
+      const tb = b.date ? new Date(b.date).getTime() : 0;
+      return Math.abs(ta - rt) - Math.abs(tb - rt);
+    });
+  }
+  // Lock onto the closest match's date + base name, then collect every cohort
+  // sibling sharing that (date, base name) so partial-cohort assignments still
+  // qualify.
+  const best = candidates[0];
+  const targetBase = baseName(best.activity_name);
+  for(const a of candidates){
+    if(a.date === best.date && baseName(a.activity_name) === targetBase){
+      out.add(a.activity_id);
+    }
+  }
+  return out;
+}
+
 function reviewsForInstructor(instructorId){
   // Method A: via review_attendance table (auto-derived during parsing)
   const seenIds = new Set();
@@ -988,15 +1058,24 @@ function reviewsForInstructor(instructorId){
     });
   // Method B: direct activity→review link — catches cases where the string-match
   // linking succeeded but review_attendance wasn't populated (e.g. re-imports).
+  // Matches against every cohort activity of the review's SG (not just the
+  // single linked_activity_id) so any partial cohort assignment qualifies, and
+  // falls back to on-the-fly resolution from sg_code so historical reviews
+  // whose link is empty in the published JSON are still surfaced.
   const myActivityIds = new Set(
     (State.data.assignments||[])
       .filter(a => a.instructor_id === instructorId && a.is_active !== false)
       .map(a => a.activity_id)
   );
   (State.data.review_sessions||[]).forEach(rev => {
-    if(rev.linked_activity_id && myActivityIds.has(rev.linked_activity_id) && !seenIds.has(rev.review_id)){
-      seenIds.add(rev.review_id);
-      results.push(Object.assign({}, rev, { _attendance: null }));
+    if(seenIds.has(rev.review_id)) return;
+    const sgActIds = findReviewSgActivities(rev);
+    for(const aid of sgActIds){
+      if(myActivityIds.has(aid)){
+        seenIds.add(rev.review_id);
+        results.push(Object.assign({}, rev, { _attendance: null }));
+        return;
+      }
     }
   });
   return results;
@@ -5538,12 +5617,19 @@ function detectReviewWithoutSg(){
 function detectSgMissingReview(){
   const out = [];
   for(const r of State.data.review_sessions){
-    if(!r.linked_activity_id) continue;
-    const sgInstructors = State.data.assignments.filter(a => a.activity_id === r.linked_activity_id).map(a => a.instructor_id);
+    // Expand to all cohort activities of the review's SG so partial-cohort
+    // assignments are evaluated as legitimately responsible for the review.
+    const sgActIds = findReviewSgActivities(r);
+    if(!sgActIds.size) continue;
+    const sgInstructors = new Set(
+      State.data.assignments
+        .filter(a => sgActIds.has(a.activity_id) && a.is_active !== false)
+        .map(a => a.instructor_id)
+    );
     const reviewInstructors = new Set(State.data.review_attendance.filter(x => x.review_id === r.review_id).map(x => x.instructor_id));
     sgInstructors.forEach(iid => {
       if(!reviewInstructors.has(iid)){
-        out.push({instructor_id:iid, activity_id:r.linked_activity_id, review_id:r.review_id});
+        out.push({instructor_id:iid, activity_id:r.linked_activity_id||[...sgActIds][0], review_id:r.review_id});
       }
     });
   }
@@ -5552,8 +5638,13 @@ function detectSgMissingReview(){
 function detectReviewNotOnSg(){
   const out = [];
   for(const r of State.data.review_sessions){
-    if(!r.linked_activity_id) continue;
-    const sgSet = new Set(State.data.assignments.filter(a => a.activity_id === r.linked_activity_id).map(a => a.instructor_id));
+    const sgActIds = findReviewSgActivities(r);
+    if(!sgActIds.size) continue;
+    const sgSet = new Set(
+      State.data.assignments
+        .filter(a => sgActIds.has(a.activity_id) && a.is_active !== false)
+        .map(a => a.instructor_id)
+    );
     State.data.review_attendance.filter(x => x.review_id === r.review_id).forEach(x => {
       if(!sgSet.has(x.instructor_id)) out.push({instructor_id:x.instructor_id, review_id:r.review_id});
     });
@@ -6192,27 +6283,68 @@ function parseWorkbook(wb){
     }
   }
 
-  // 7. Link reviews to activities by SG code
+  // 7. Link reviews to activities by SG code.
+  // Match by name first; fall back to bare "SGn" number matching so months
+  // whose SG activities lack a module prefix (e.g. "SG1 (A)" in Jan/Feb) still
+  // link to prefixed review sg_codes like "MNI SG1". Then pick the candidate
+  // closest to the review_date so cross-month false-matches are avoided —
+  // without this the runtime "first match wins" behaviour was leaving every
+  // Jan–April review unlinked, which in turn skipped auto-derived attendance
+  // for the entire historical roster period.
+  const _baseName = (n) => String(n||'').toLowerCase().replace(/\s*\([^)]*\)\s*$/,'').trim();
+  const _sgNumOf  = (s) => { const m = String(s||'').toLowerCase().match(/sg\s*0*(\d+)/); return m ? m[1] : ''; };
   for(const r of data.review_sessions){
-    const sg = (r.sg_code||'').toLowerCase().replace(/\s+/g,'').replace('sg','');
-    if(!sg) continue;
-    const found = data.master_schedule.find(a =>
-      isSGActivity(a) &&
-      (a.activity_name||'').toLowerCase().replace(/\s+/g,'').replace('sg','').includes(sg)
-    );
-    if(found) r.linked_activity_id = found.activity_id;
+    const sgRaw  = (r.sg_code||'').toLowerCase();
+    const sgNorm = sgRaw.replace(/\s+/g,'').replace('sg','');
+    if(!sgNorm) continue;
+    const sgNum = _sgNumOf(r.sg_code);
+    const candidates = data.master_schedule.filter(a => {
+      if(!isSGActivity(a)) return false;
+      const an = (a.activity_name||'').toLowerCase().replace(/\s+/g,'').replace('sg','');
+      if(an && (an.includes(sgNorm) || sgNorm.includes(an))) return true;
+      if(sgNum && _sgNumOf(a.activity_name) === sgNum) return true;
+      return false;
+    });
+    if(!candidates.length) continue;
+    if(r.review_date && candidates.length > 1){
+      const rt = new Date(r.review_date).getTime();
+      candidates.sort((a,b) => {
+        const ta = a.date ? new Date(a.date).getTime() : 0;
+        const tb = b.date ? new Date(b.date).getTime() : 0;
+        return Math.abs(ta - rt) - Math.abs(tb - rt);
+      });
+    }
+    r.linked_activity_id = candidates[0].activity_id;
   }
   // 7b. Auto-derive review attendance from linked SG assignments — but only
   // for (review_id, instructor_id) pairs that aren't already present from the
   // attendance worksheet, otherwise the real Present/Absent/Excused status
   // would be diluted by stub auto-derived records.
+  //
+  // Walks every cohort sibling (same date, same base activity_name) of the
+  // linked activity so that an instructor assigned to only one or two cohorts
+  // of an SG is still recognised as responsible for that SG's review session.
   {
     const seen = new Set(
       data.review_attendance.map(a => (a.review_id||'')+'|'+(a.instructor_id||''))
     );
     for(const r of data.review_sessions){
       if(!r.linked_activity_id) continue;
-      const sgInsts = new Set(data.assignments.filter(a => a.activity_id === r.linked_activity_id && a.is_active !== false).map(a => a.instructor_id));
+      const linkedAct = data.master_schedule.find(a => a.activity_id === r.linked_activity_id);
+      if(!linkedAct) continue;
+      const targetBase = _baseName(linkedAct.activity_name);
+      const cohortIds = new Set();
+      for(const a of data.master_schedule){
+        if(isSGActivity(a) && a.date === linkedAct.date && _baseName(a.activity_name) === targetBase){
+          cohortIds.add(a.activity_id);
+        }
+      }
+      if(!cohortIds.size) cohortIds.add(r.linked_activity_id);
+      const sgInsts = new Set(
+        data.assignments
+          .filter(a => cohortIds.has(a.activity_id) && a.is_active !== false)
+          .map(a => a.instructor_id)
+      );
       sgInsts.forEach(iid => {
         const k = r.review_id+'|'+iid;
         if(seen.has(k)) return;
