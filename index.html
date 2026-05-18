@@ -459,6 +459,164 @@ function getSeed(){
   try{ return JSON.parse(el.textContent); } catch(e){ console.error(e); return null; }
 }
 
+/* -------- 1c. COLOR HELPERS ---------------------------
+   Centralized colouring for assignments + review sessions so the
+   Calendar, My-assignments, Review-sessions and dashboard cards all
+   pick the SAME colour for the SAME source row, regardless of which
+   render path produces the DOM.  See acceptance checks in spec.
+------------------------------------------------------------- */
+
+// Fallback discipline colours used when imported data has no original cell
+// colour for a review session.  Keep keys lower-cased for lookup convenience.
+const REVIEW_DISCIPLINE_COLORS = {
+  'pathology': '#f4d03f',                       // yellow
+  'clinical skills': '#58c47a',                 // green
+  'microbiology': '#3b8fd1',                    // blue
+  'micro pharm': '#3b8fd1',
+  'micro immuno pharm': '#3b8fd1',
+  'microbiology-pharmacology': '#3b8fd1',
+  'pharmacology': '#3b8fd1',
+  'pathophysiology': '#9b59b6',                 // purple
+  'hpwp': '#9b59b6',
+};
+
+// Stable palette for hash-based activity colouring.  Tuned for legibility
+// on both light & dark themes.
+const ACTIVITY_FALLBACK_PALETTE = [
+  '#4f8fd6', '#e08a3c', '#5cb38a', '#c25c8a',
+  '#7a6dbf', '#d8a93a', '#46a59f', '#cc6b5b',
+  '#6c8fbf', '#a07ab0', '#7aa56b', '#b88a3c',
+];
+
+function _normalize(s){ return String(s||'').trim().toLowerCase(); }
+
+// Tiny deterministic 32-bit hash so the same key always picks the same
+// palette slot.  djb2 — good enough for colour bucketing.
+function _stableHash(str){
+  let h = 5381;
+  const s = String(str||'');
+  for(let i=0;i<s.length;i++){ h = ((h<<5) + h) ^ s.charCodeAt(i); }
+  return h >>> 0;
+}
+
+// Extract a canonical "session code" such as "RHPS SG7" or "DNPR SG1"
+// from an activity name / sg_code so cohorts (A/B/C/D) collapse to one
+// colour bucket and SG cohort rows match their review session.
+function _activityCodeKey(s){
+  const m = String(s||'').toUpperCase().match(/\b([A-Z]{2,6})\s*SG\s*0*(\d{1,3})\b/);
+  if(m) return m[1] + ' SG' + m[2];
+  return _normalize(s).replace(/\s+\([a-z]\)$/,'').replace(/\s+/g,' ').trim();
+}
+
+// Resolve an activity record for an assignment using the documented
+// priority: (1) activity_id, (2) date+start+name, (3) activity code.
+function _resolveActivityForAssignment(a){
+  if(!a) return null;
+  const sched = (State.data && State.data.master_schedule) || [];
+  if(a.activity_id){
+    const byId = sched.find(x => x.activity_id === a.activity_id);
+    if(byId) return byId;
+  }
+  if(a.date && a.start_time && (a.activity_name || a.name)){
+    const name = _normalize(a.activity_name || a.name);
+    const byTriple = sched.find(x =>
+      x.date === a.date &&
+      String(x.start_time||'') === String(a.start_time||'') &&
+      _normalize(x.activity_name) === name
+    );
+    if(byTriple) return byTriple;
+  }
+  const code = _activityCodeKey(a.activity_name || a.name || a.sg_code);
+  if(code){
+    const byCode = sched.find(x => _activityCodeKey(x.activity_name) === code);
+    if(byCode) return byCode;
+  }
+  return null;
+}
+
+// Return an explicit colour stored on the record by any of the common
+// upstream field names.  Lets us honour a source cell colour as soon as
+// the parser starts capturing it, without further code changes.
+function _explicitColor(rec){
+  if(!rec) return null;
+  const keys = ['source_color','sourceColor','cell_color','cellColor',
+                'color','fill','fillColor','bg','bgColor','background_color'];
+  for(const k of keys){
+    const v = rec[k];
+    if(v && typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+// PUBLIC: pick the display colour for an assignment OR a master_schedule row.
+// Returns a CSS colour string suitable for `background`.
+function getActivityDisplayColor(activityOrAssignment){
+  const rec = activityOrAssignment || {};
+  // 1) Explicit colour on the assignment itself
+  let explicit = _explicitColor(rec);
+  if(explicit) return explicit;
+  // Look up canonical activity
+  const act = _resolveActivityForAssignment(rec) || rec;
+  explicit = _explicitColor(act);
+  if(explicit) return explicit;
+  // Stable hash from the canonical code + type so cohorts share a colour
+  const key = _activityCodeKey(act.activity_name || rec.activity_name || act.sg_code)
+            + '|' + _normalize(act.activity_type || '');
+  if(!key.replace(/[|\s]/g,'')) return 'var(--primary-soft)';
+  const idx = _stableHash(key) % ACTIVITY_FALLBACK_PALETTE.length;
+  return ACTIVITY_FALLBACK_PALETTE[idx];
+}
+
+// PUBLIC: pick the display colour for a review session.  Honours an
+// explicit imported cell colour when present, otherwise falls back to
+// the discipline colour map.
+function getReviewDisciplineColor(reviewSession){
+  const r = reviewSession || {};
+  const explicit = _explicitColor(r);
+  if(explicit) return explicit;
+  const disc = _normalize(r.discipline);
+  if(disc){
+    if(REVIEW_DISCIPLINE_COLORS[disc]) return REVIEW_DISCIPLINE_COLORS[disc];
+    // Substring match so e.g. "Micro Pharm" or "Microbiology / Pharm" still resolve
+    for(const k of Object.keys(REVIEW_DISCIPLINE_COLORS)){
+      if(disc.includes(k)) return REVIEW_DISCIPLINE_COLORS[k];
+    }
+  }
+  // Last-resort: stable hash so each unknown discipline still gets a
+  // consistent colour rather than the same dull fallback.
+  const key = disc || _normalize(r.activity_name || r.sg_code);
+  if(key){
+    const idx = _stableHash(key) % ACTIVITY_FALLBACK_PALETTE.length;
+    return ACTIVITY_FALLBACK_PALETTE[idx];
+  }
+  return 'var(--yellow-soft)';
+}
+
+// PUBLIC: pick a foreground text colour with strong contrast against the
+// given background.  Returns '#000' or '#fff' using the WCAG-style YIQ
+// formula.  Accepts hex (#rgb / #rrggbb), rgb()/rgba(), or anything else
+// (in which case we default to dark text on the assumption that CSS
+// variables resolve to light surfaces).
+function getReadableTextColor(backgroundColor){
+  const bg = String(backgroundColor||'').trim();
+  let r=255,g=255,b=255;
+  if(bg.startsWith('#')){
+    let h = bg.slice(1);
+    if(h.length === 3) h = h.split('').map(c=>c+c).join('');
+    if(h.length === 6){
+      r = parseInt(h.slice(0,2),16);
+      g = parseInt(h.slice(2,4),16);
+      b = parseInt(h.slice(4,6),16);
+    }
+  } else {
+    const m = bg.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if(m){ r=+m[1]; g=+m[2]; b=+m[3]; }
+    else { return '#111'; }  // unknown (e.g. CSS var) — assume light surface
+  }
+  const yiq = (r*299 + g*587 + b*114) / 1000;
+  return yiq >= 150 ? '#111' : '#fff';
+}
+
 /* -------- 1b. LEAVE OF ABSENCE ------------------------- */
 const LEAVE_DAILY_LIMIT = 3;  // approval rule: a date is "full" once 3+ instructors are approved on it
 const LEAVE_TYPES = ['Personal','Sick','Bereavement','Conference / Professional Development','Vacation','Maternity / Paternity','Other'];
@@ -753,6 +911,11 @@ async function bootstrap(){
       // so this seed-sync is no longer needed and has been removed.
     }
     State.settings = Object.assign(State.settings, persisted.settings || {});
+    // Migrate legacy coordinator passcode "1234" → current DEFAULT_PASSCODE.
+    if(State.settings.passcode === "1234"){
+      State.settings.passcode = DEFAULT_PASSCODE;
+      try{ await persist(); }catch(e){}
+    }
     State.me = persisted.me || null;
     State.overrides = persisted.overrides || {};
     State.approvedLeaveImported = persisted.approvedLeaveImported || [];
@@ -1543,19 +1706,22 @@ function instructorDashboard(main){
 function assignmentItem(a){
   const act = activityById(a.activity_id) || {};
   const isUpcoming = a.date >= new Date().toISOString().slice(0,10);
-  const item = el('div',{class:'item'+(isUpcoming?' status-ok':'')});
+  const bg = getActivityDisplayColor(a);
+  const fg = getReadableTextColor(bg);
+  const item = el('div',{class:'item'+(isUpcoming?' status-ok':''),
+    style:{background:bg, color:fg}});
   const head = el('div',{class:'item-head'},
-    el('div',{class:'item-title'}, act.activity_name || a.activity_name || '(activity)'),
+    el('div',{class:'item-title',style:{color:fg}}, act.activity_name || a.activity_name || '(activity)'),
     el('span',{class:'badge '+(isUpcoming?'green':'gray')}, isUpcoming?'Upcoming':'Past')
   );
   item.appendChild(head);
-  item.appendChild(el('div',{class:'meta'},
+  item.appendChild(el('div',{class:'meta',style:{color:fg, opacity:.92}},
     el('span',null, fmtDate(a.date || act.date)),
     el('span',null, [fmtTime(a.start_time||act.start_time), fmtTime(a.end_time||act.end_time)].filter(Boolean).join('–') || ''),
     el('span',null, a.location || act.location || ''),
     a.role ? el('span',null, a.role) : null,
   ));
-  if(act.description) item.appendChild(el('div',{class:'muted',style:{fontSize:'.85rem'}}, act.description));
+  if(act.description) item.appendChild(el('div',{style:{fontSize:'.85rem',color:fg,opacity:.85}}, act.description));
   // ICS export
   const dl = el('div',{class:'cluster',style:{marginTop:'.4rem'}});
   dl.appendChild(el('button',{class:'btn small secondary',onclick:()=>downloadIcsForActivity(a, act)},'Add to calendar'));
@@ -2305,21 +2471,24 @@ function downloadRosterJson(){
 
 function reviewItem(r){
   const required = r._attendance && r._attendance.attendance_required;
-  const item = el('div',{class:'item '+(required?'status-warn':'status-ok')});
+  const bg = getReviewDisciplineColor(r);
+  const fg = getReadableTextColor(bg);
+  const item = el('div',{class:'item '+(required?'status-warn':'status-ok'),
+    style:{background:bg, color:fg}});
   item.appendChild(el('div',{class:'item-head'},
-    el('div',{class:'item-title'}, r.activity_name || r.discipline || 'Review session'),
+    el('div',{class:'item-title',style:{color:fg}}, r.activity_name || r.discipline || 'Review session'),
     el('span',{class:'badge '+(required?'yellow':'blue')}, required?'Required':'Open')
   ));
-  item.appendChild(el('div',{class:'meta'},
+  item.appendChild(el('div',{class:'meta',style:{color:fg, opacity:.92}},
     el('span',null, fmtDate(r.review_date)),
     el('span',null, fmtTime(r.review_start_time)),
     el('span',null, r.review_location || ''),
     el('span',null, r.discipline || ''),
   ));
-  if(r.notes) item.appendChild(el('div',{class:'muted',style:{fontSize:'.85rem'}}, r.notes));
+  if(r.notes) item.appendChild(el('div',{style:{fontSize:'.85rem',color:fg,opacity:.85}}, r.notes));
   if(r.zoom_link){
     item.appendChild(el('div',{},
-      el('a',{href:r.zoom_link,target:'_blank',rel:'noopener'}, 'Open Zoom link →')));
+      el('a',{href:r.zoom_link,target:'_blank',rel:'noopener',style:{color:fg,textDecoration:'underline'}}, 'Open Zoom link →')));
   }
   return item;
 }
@@ -2502,17 +2671,25 @@ function buildMonthCalendar(month, opts){
       } else {
         evts.forEach(a => {
           const act = activityById(a.activity_id) || a;
+          const bg = getActivityDisplayColor(a);
+          const fg = getReadableTextColor(bg);
           day.appendChild(el('div',{
             class:'ev'+((opts.conflicts||[]).includes(ds) ? ' conflict' : ''),
+            style:{background:bg, color:fg},
             title:(act.activity_name||'Activity') + ' — click for details',
             onclick:()=>showActivityModal(act),
           }, (fmtTime(a.start_time)||'') + ' ' + ((act.activity_name||'').slice(0,18))));
         });
-        revs.forEach(rev => day.appendChild(el('div',{
-          class:'ev review',
-          title:(rev.activity_name||rev.discipline||'Review') + ' — click for details',
-          onclick:()=>modal('Review session', reviewItem(rev), [el('button',{class:'btn',onclick:closeModal},'Close')]),
-        }, (fmtTime(rev.review_start_time)||'') + ' Review')));
+        revs.forEach(rev => {
+          const bg = getReviewDisciplineColor(rev);
+          const fg = getReadableTextColor(bg);
+          day.appendChild(el('div',{
+            class:'ev review',
+            style:{background:bg, color:fg},
+            title:(rev.activity_name||rev.discipline||'Review') + ' — click for details',
+            onclick:()=>modal('Review session', reviewItem(rev), [el('button',{class:'btn',onclick:closeModal},'Close')]),
+          }, (fmtTime(rev.review_start_time)||'') + ' Review'));
+        });
       }
     }
     cal.appendChild(day);
